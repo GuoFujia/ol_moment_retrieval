@@ -546,7 +546,7 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
         gt_end = gt["short_memory_start"] + np.argmax(gt["end_label"])
         gt_span = (gt_start, gt_end)
 
-        print("frame pred: gt:",gt_span," sub: ",candidate_moments)
+        # print("frame pred: gt:",gt_span," sub: ",candidate_moments)
         # input("please wait")
 
         # 计算该 query 的 R@n, IoU=m
@@ -585,8 +585,8 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
                 pred_scores.extend(pred_scores_chunk[:min_len])
                 gt_scores.extend(gt_scores_chunk[:min_len])
 
-                print("saliency: gt:",gt_scores," sub:",pred_scores)
-                input("please wait")
+                # print("saliency: gt:",gt_scores," sub:",pred_scores)
+                # input("please wait")
             
             # 再次验证长度
             assert len(pred_scores) == len(gt_scores), \
