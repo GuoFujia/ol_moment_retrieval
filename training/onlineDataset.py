@@ -309,50 +309,47 @@ class StartEndDataset(Dataset):
         return chunk_infos,total_length
     # 对给定的chunk，获取对应的片段的st时间戳、ed时间戳、语义（整个片段）在视频特征中的位置 
     def get_chunk_labels(self, boundary, gt_boundary, stride):
-        """Get the video features, zero padding if needed.
-        Args:
-            boundary (list[int]): frame boundary of memory features.
-            gt_boundary (list[float]):
-            stride (int):
-        Return: 
-            s_label, e_label, se_label
-            分别表示boundary对应的一段视频是start, end 或者属于gt的二值标签
-        """
+        """修改后的标签生成函数，确保标签互斥"""
         s, e = boundary
         mem_len = e - s
         s_gt, e_gt = gt_boundary
-        #   这部分后续根据需要添加
-        # if self.gaussian_label:
-        #     span_length = e_gt - s_gt
-        #     t = np.arange(s, e, stride)
-        #     sigma_s = self.gaussian_label_width[0] * span_length
-        #     sigma_e = self.gaussian_label_width[1] * span_length
-        #     sigma_se = self.gaussian_label_width[2] * span_length
-        #     s_label = self.__gaussian_label__(t, s_gt, sigma_s, 'start')
-        #     e_label = self.__gaussian_label__(t, e_gt, sigma_e, 'end')
-        #     se_label = self.__gaussian_label__(t, (s_gt+e_gt)/2, sigma_se, 'semantic')
         s_gt, e_gt = round(s_gt), round(e_gt)
+        
+        # 初始化标签
         s_label = np.zeros(mem_len)
         e_label = np.zeros(mem_len)
         se_label = np.zeros(mem_len)
+        
+        # 计算相对位置
         diff_s = s_gt - s
         diff_e = e_gt - s
+        
+        # 设置起始帧标签
         if diff_s >= 0 and diff_s < mem_len:
-            s_label[s_gt-s] = 1
+            s_label[diff_s] = 1
+        
+        # 设置结束帧标签
         if diff_e >= 0 and diff_e < mem_len:
-            e_label[e_gt-s] = 1
+            e_label[diff_e] = 1
+        
+        # 设置语义相关帧标签 - 排除起始帧和结束帧
         diff_s = max(0, diff_s)
         diff_e = min(mem_len, diff_e)
-        if diff_s < mem_len:
-            if diff_e < mem_len:
-                se_label[diff_s:diff_e+1] = 1
-            else:
-                se_label[diff_s:] = 1
-        #   如果stride!=1，作下采样
+        
+        if diff_s < mem_len and diff_e >= diff_s:
+            # 设置中间帧（排除起始帧和结束帧）
+            start_idx = diff_s + 1  # 排除起始帧
+            end_idx = diff_e  # 排除结束帧（因为Python切片是左闭右开的）
+            
+            if start_idx < end_idx:  # 确保有中间帧
+                se_label[start_idx:end_idx] = 1
+        
+        # 如果stride!=1，作下采样
         if stride != 1:
             s_label = s_label[::stride]
             e_label = e_label[::stride]
             se_label = se_label[::stride]
+        
         return s_label, e_label, se_label
 
     def __getitem__(self,chunk_idx):
