@@ -92,6 +92,7 @@ class OLMomentDETR(nn.Module):
         self.n_input_proj = n_input_proj
         # self.foreground_thd = foreground_thd
         # self.background_thd = background_thd
+
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         relu_args = [True] * 3
         relu_args[n_input_proj-1] = False
@@ -133,6 +134,10 @@ class OLMomentDETR(nn.Module):
         src_vid = self.input_vid_proj(src_vid)
         src_txt = self.input_txt_proj(src_txt)
         #   拼接视频和文本的特征，掩码
+
+        print("src_vid:",src_vid.shape,"src_txt:",src_txt.shape)
+        input("请按回车键继续...")
+        
         src = torch.cat([src_vid, src_txt], dim=1)  # (bsz, L_vid+L_txt, d)
         mask = torch.cat([src_vid_mask, src_txt_mask], dim=1).bool()  # (bsz, L_vid+L_txt)
         #   分别生成位置编码并拼接
@@ -157,9 +162,17 @@ class OLMomentDETR(nn.Module):
         #       我想着是应该把queries设置为short_memory_sample_length
         #       但又不确定这样模型的逻辑对不对
         
-        #   最后一层layer的输出
-        short_start = memory_len[0]
+        #   使用掩码确定实际的long memory长度
+        long_memory_mask = src_vid_mask[:, :memory_len[0]]
+        actual_long_len = long_memory_mask.sum(dim=1).max().item()  # 获取batch中最长的有效长度
+        
+        # 使用实际长度进行切片
+        short_start = min(memory_len[0], actual_long_len)
         short_end = short_start + memory_len[1]
+
+        print("actual_long_len:",actual_long_len,"memory_len:",memory_len)
+        input("请按回车键继续...")
+        
         out = {'frame_pred': self.frame_class_embed(hs)[-1][:, short_start:short_end]}
         
         # print("模型的帧预测结果：{}".format(out["frame_pred"]))

@@ -362,7 +362,7 @@ class StartEndDataset(Dataset):
         short_memory_end = short_memory_start+self.short_memory_sample_length
         long_memory_start=None
         long_memory_end=None
-        if self.load_future_memory and self.long_memory_sample_length > 0:
+        if self.long_memory_sample_length > 0:
             long_memory_start = short_memory_start - self.long_memory_sample_length
             long_memory_start=max(long_memory_start,0)
             long_memory_end = short_memory_start
@@ -375,11 +375,14 @@ class StartEndDataset(Dataset):
 
         model_inputs = dict()
         model_inputs["short_memory_start"]=short_memory_start
-        #   query feature
+        
+        # 修改查询特征的处理
         if self.use_glove:
-            model_inputs["query_feat"] = self.get_query(chunk_info["query"])
+            query_feat = self.get_query(chunk_info["query"])
         else:
-            model_inputs["query_feat"] = self._get_query_feat_by_qid(chunk_info["qid"])
+            query_feat = self._get_query_feat_by_qid(chunk_info["qid"])
+        # 确保查询特征被正确添加到model_inputs中
+        model_inputs["query_feat"] = query_feat
         #?# 这里按照一定使用视频写了，但是保留了音视频对齐的逻辑. 要不还得给short，long，future分别添加max_v_l参数。后续有需要再加上这个逻辑
         #   video feature
         if self.use_video:
@@ -438,15 +441,17 @@ class StartEndDataset(Dataset):
                     [model_inputs["video_feat_short"], tef_short], dim=1)  # (Lv, Dv+2)
             else:
                 model_inputs["video_feat_short"] = tef_short
+            
             #   long
-            tef_st_long = torch.arange(0, ctx_l_long, 1.0) / ctx_l_long
-            tef_ed_long = tef_st_long + 1.0 / ctx_l_long
-            tef_long = torch.stack([tef_st_long, tef_ed_long], dim=1)  # (Lv, 2)
-            if self.use_video:
-                model_inputs["video_feat_long"] = torch.cat(
-                    [model_inputs["video_feat_long"], tef_long], dim=1)  # (Lv, Dv+2)
-            else:
-                model_inputs["video_feat_long"] = tef_long
+            if ctx_l_long > 0:  # 添加判断
+                tef_st_long = torch.arange(0, ctx_l_long, 1.0) / ctx_l_long
+                tef_ed_long = tef_st_long + 1.0 / ctx_l_long
+                tef_long = torch.stack([tef_st_long, tef_ed_long], dim=1)
+                if self.use_video:
+                    model_inputs["video_feat_long"] = torch.cat(
+                        [model_inputs["video_feat_long"], tef_long], dim=1)
+                else:
+                    model_inputs["video_feat_long"] = tef_long
             #   future
             if self.load_future_memory and self.future_memory_sample_length>0:
                 tef_st_future = torch.arange(0, ctx_l_future, 1.0) / ctx_l_future
@@ -780,17 +785,24 @@ class StartEndDataset(Dataset):
         return torch.from_numpy(a_feat)  # (Lv, D)
 
 def start_end_collate_ol(batch):
-    # 提取元数据
     batch_meta = [e["meta"] for e in batch]
-
-    # 获取 model_inputs 的所有键
     model_inputs_keys = batch[0]["model_inputs"].keys()
     batched_data = dict()
 
-    # 遍历每个键，根据键的类型进行不同的处理
     for k in model_inputs_keys:
+        if k == "query_feat":
+            # 收集所有查询特征
+            query_feats = [e["model_inputs"][k] for e in batch]
+            # 使用pad_sequences_1d处理变长序列
+            padded_feats, mask = pad_sequences_1d(
+                query_feats,
+                dtype=torch.float32,
+                fixed_length=None
+            )
+            batched_data[k] = (padded_feats, mask)
+            continue
+
         if k == "short_memory_start":
-            # batched_data[k] = torch.tensor([e["model_inputs"][k] for e in batch], dtype=torch.long)
             batched_data[k] = [dict(short_memory_start=e["model_inputs"][k]) for e in batch]
             continue
         if k == "start_label":
@@ -826,21 +838,28 @@ def start_end_collate_ol(batch):
             continue
 
         # 默认处理其他特征（填充变长序列）
-        # 跳过空样本
-        valid_data = [e["model_inputs"][k] for e in batch if len(e["model_inputs"][k]) > 0]
-        if len(valid_data) > 0:  # 如果有非空样本
-            batched_data[k] = pad_sequences_1d(valid_data, dtype=torch.float32, fixed_length=None)
+        if k in ["video_feat_long", "video_feat_short", "video_feat_future"]:
+            valid_data = [e["model_inputs"][k] for e in batch if len(e["model_inputs"][k]) > 0]
+            if len(valid_data) > 0:
+                # 使用固定长度填充
+                max_len = max(len(x) for x in valid_data)
+                batched_data[k] = pad_sequences_1d(valid_data, dtype=torch.float32, fixed_length=max_len)
 
     return batch_meta, batched_data
 
 def prepare_batch_inputs(batched_model_inputs, device, non_blocking=False):
-
-    #   看一下输入的batched_model_inputs都有什么内容
-    #   这里的batched_model_inputs里面的label好像也正常
-    # print("see batched_model_inputs contetn:{}".format(batched_model_inputs["semantic_label"]))
-
     # 初始化 memory_len
     memory_len = [0, 0, 0]  # [long_memory_sample_length, short_memory_sample_length, future_memory_sample_length]
+
+    # 获取batch中所有特征的第一维大小
+    batch_size = None
+    if "video_feat_long" in batched_model_inputs:
+        batch_size = batched_model_inputs["video_feat_long"][0].shape[0]
+    elif "video_feat_short" in batched_model_inputs:
+        batch_size = batched_model_inputs["video_feat_short"][0].shape[0]
+    
+    if batch_size is None:
+        raise ValueError("No valid video features found in batch")
 
     # 拼接 src_vid 和 src_vid_mask
     src_vid_list = []
@@ -848,27 +867,42 @@ def prepare_batch_inputs(batched_model_inputs, device, non_blocking=False):
 
     # 处理 long memory
     if "video_feat_long" in batched_model_inputs:
-        src_vid_list.append(batched_model_inputs["video_feat_long"][0].to(device, non_blocking=non_blocking))
-        src_vid_mask_list.append(batched_model_inputs["video_feat_long"][1].to(device, non_blocking=non_blocking))
-        memory_len[0] = batched_model_inputs["video_feat_long"][0].shape[1]  # 获取 long memory 的长度
-    else:
-        memory_len[0] = 0  # 如果没有 long memory，长度为 0
+        feat = batched_model_inputs["video_feat_long"][0].to(device, non_blocking=non_blocking)
+        mask = batched_model_inputs["video_feat_long"][1].to(device, non_blocking=non_blocking)
+        # 确保所有样本具有相同的序列长度
+        max_len = feat.shape[1]
+        if feat.shape[0] != batch_size:
+            # 如果需要，进行填充或截断
+            feat = feat[:batch_size, :max_len]
+            mask = mask[:batch_size, :max_len]
+        src_vid_list.append(feat)
+        src_vid_mask_list.append(mask)
+        memory_len[0] = max_len
+
 
     # 处理 short memory
     if "video_feat_short" in batched_model_inputs:
-        src_vid_list.append(batched_model_inputs["video_feat_short"][0].to(device, non_blocking=non_blocking))
-        src_vid_mask_list.append(batched_model_inputs["video_feat_short"][1].to(device, non_blocking=non_blocking))
-        memory_len[1] = batched_model_inputs["video_feat_short"][0].shape[1]  # 获取 short memory 的长度
-    else:
-        memory_len[1] = 0  # 如果没有 short memory，长度为 0
+        feat = batched_model_inputs["video_feat_short"][0].to(device, non_blocking=non_blocking)
+        mask = batched_model_inputs["video_feat_short"][1].to(device, non_blocking=non_blocking)
+        max_len = feat.shape[1]
+        if feat.shape[0] != batch_size:
+            feat = feat[:batch_size, :max_len]
+            mask = mask[:batch_size, :max_len]
+        src_vid_list.append(feat)
+        src_vid_mask_list.append(mask)
+        memory_len[1] = max_len
 
     # 处理 future memory
     if "video_feat_future" in batched_model_inputs:
-        src_vid_list.append(batched_model_inputs["video_feat_future"][0].to(device, non_blocking=non_blocking))
-        src_vid_mask_list.append(batched_model_inputs["video_feat_future"][1].to(device, non_blocking=non_blocking))
-        memory_len[2] = batched_model_inputs["video_feat_future"][0].shape[1]  # 获取 future memory 的长度
-    else:
-        memory_len[2] = 0  # 如果没有 future memory，长度为 0
+        feat = batched_model_inputs["video_feat_future"][0].to(device, non_blocking=non_blocking)
+        mask = batched_model_inputs["video_feat_future"][1].to(device, non_blocking=non_blocking)
+        max_len = feat.shape[1]
+        if feat.shape[0] != batch_size:
+            feat = feat[:batch_size, :max_len]
+            mask = mask[:batch_size, :max_len]
+        src_vid_list.append(feat)
+        src_vid_mask_list.append(mask)
+        memory_len[2] = max_len
 
     # 按顺序拼接 src_vid 和 src_vid_mask
     src_vid = torch.cat(src_vid_list, dim=1) if src_vid_list else torch.tensor([]).to(device)

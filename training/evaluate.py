@@ -250,30 +250,30 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
                 if len(saliency_scores) == 0 or len(pred) == 0 or idx>=len(saliency_scores):
                     continue
 
-                # 获取当前样本的标签（添加类型检查）
-                try:
-                    start_label = targets['start_label'][idx] if torch.is_tensor(targets['start_label']) else targets['start_label']
-                    end_label = targets['end_label'][idx] if torch.is_tensor(targets['end_label']) else targets['end_label']
-                    semantic_label = targets['semantic_label'][idx] if torch.is_tensor(targets['semantic_label']) else targets['semantic_label']
-                    saliency_label = targets.get('saliency_label')
-                    if saliency_label is not None:
-                        saliency_label = saliency_label[idx] if torch.is_tensor(saliency_label) else saliency_label
+                # # 获取当前样本的标签（添加类型检查）
+                # try:
+                #     start_label = targets['start_label'][idx] if torch.is_tensor(targets['start_label']) else targets['start_label']
+                #     end_label = targets['end_label'][idx] if torch.is_tensor(targets['end_label']) else targets['end_label']
+                #     semantic_label = targets['semantic_label'][idx] if torch.is_tensor(targets['semantic_label']) else targets['semantic_label']
+                #     saliency_label = targets.get('saliency_label')
+                #     if saliency_label is not None:
+                #         saliency_label = saliency_label[idx] if torch.is_tensor(saliency_label) else saliency_label
 
-                    # 转换为numpy数组（如果需要）
-                    if torch.is_tensor(start_label):
-                        start_label = start_label.cpu().numpy()
-                    if torch.is_tensor(end_label):
-                        end_label = end_label.cpu().numpy()
-                    if torch.is_tensor(semantic_label):
-                        semantic_label = semantic_label.cpu().numpy()
-                    if torch.is_tensor(saliency_label):
-                        saliency_label = saliency_label.cpu().numpy()
-                except Exception as e:
-                    print(f"\nError processing labels for sample {idx}:")
-                    print(f"Error: {str(e)}")
-                    print("Targets content:", targets)
-                    input("发生错误，请查看上述信息，按回车继续...")
-                    continue
+                #     # 转换为numpy数组（如果需要）
+                #     if torch.is_tensor(start_label):
+                #         start_label = start_label.cpu().numpy()
+                #     if torch.is_tensor(end_label):
+                #         end_label = end_label.cpu().numpy()
+                #     if torch.is_tensor(semantic_label):
+                #         semantic_label = semantic_label.cpu().numpy()
+                #     if torch.is_tensor(saliency_label):
+                #         saliency_label = saliency_label.cpu().numpy()
+                # except Exception as e:
+                #     print(f"\nError processing labels for sample {idx}:")
+                #     print(f"Error: {str(e)}")
+                #     print("Targets content:", targets)
+                #     input("发生错误，请查看上述信息，按回车继续...")
+                #     continue
 
                 cur_chunk_pred = dict(
                     qid=meta["qid"],
@@ -454,9 +454,6 @@ def start_inference(opt, domain=None):
     eval_dataset = StartEndDataset(**dataset_config)
     model, criterion, _, _ = setup_model(opt)
 
-    #   先注释掉加载模型权重的代码，看能跑通不
-    # checkpoint = torch.load(opt.model_path)
-    # model.load_state_dict(checkpoint["model"])
     
     logger.info("Model checkpoint: {}".format(opt.model_path))
     if not load_labels:
