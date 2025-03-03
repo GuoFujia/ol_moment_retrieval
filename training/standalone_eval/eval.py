@@ -520,8 +520,38 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
             i += 1
         else:
             j += 1
+        
+    #   将匹配后的gt和pred按照"qid，vid"分组,并按时间顺序排序
+    matched_data_grouped = {}
+    for sub, gt in matched_data:
+        key = (sub["qid"], sub["vid"])
+        if key not in matched_data_grouped:
+            matched_data_grouped[key] = []
+        matched_data_grouped[key].append((sub, gt))
+    
+    # 对每组内的样本按照时间顺序排序
+    for key in matched_data_grouped:
+        matched_data_grouped[key].sort(key=lambda x: x[1]["short_memory_start"])
+        
+        # 拼接每组内的预测标签
+        for i in range(len(matched_data_grouped[key])-1):
+            cur_sub, cur_gt = matched_data_grouped[key][i]
+            next_sub, next_gt = matched_data_grouped[key][i+1]
+            
+            # 拼接frame_prob预测
+            cur_sub["pred_frame_prob"].extend(next_sub["pred_frame_prob"])
+            
+            # 拼接saliency_scores预测(如果存在)
+            if "pred_saliency_scores" in cur_sub and "pred_saliency_scores" in next_sub:
+                cur_sub["pred_saliency_scores"].extend(next_sub["pred_saliency_scores"])
 
-
+    # 打印部分匹配的gt和pred
+    print("部分匹配的gt和pred:")
+    for key in matched_data_grouped:
+        print(f"query: {key[0]}, video: {key[1]}")
+        for sub, gt in matched_data_grouped[key]:
+            print(f"gt: {gt['short_memory_start']}, pred: {sub['pred_start']}")
+    # input("请按回车键继续...")
 
     # ================== 2. 片段定位评估（R@n, IoU=m）==================
     r_at_n_metrics = OrderedDict()
@@ -529,36 +559,58 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
         for m in iou_thresholds:
             r_at_n_metrics[f"R@{n},IoU={m}"] = 0.0
 
-    # 遍历每个匹配的 query-video 对
-    for sub, gt in matched_data:
+    # 遍历每个匹配的 query-video 组
+    for key, group in matched_data_grouped.items():
+        # 获取该组的第一个gt来获取视频总长度
+        _, first_gt = group[0]
+        clip_length = first_gt["duration_frame"]
 
+        # 收集该组内所有的预测概率
+        all_st_probs = []
+        all_ed_probs = []
+        all_pred_starts = []
+        for sub, _ in group:
+            all_st_probs.extend(np.array(sub["pred_frame_prob"])[:, 0])
+            all_ed_probs.extend(np.array(sub["pred_frame_prob"])[:, 2])
+            all_pred_starts.extend([sub["pred_start"]] * len(sub["pred_frame_prob"]))
 
-        # 生成候选片段 (start, end, confidence)
-        candidate_moments = generate_candidate_moments(
-            pred_start=sub["pred_start"],
-            st_probs=np.array(sub["pred_frame_prob"])[:, 0],  # 起始概率
-            ed_probs=np.array(sub["pred_frame_prob"])[:, 2],  # 结束概率
-            clip_length=gt["duration_frame"]  # 视频总长度（用于归一化）
+        # 生成跨chunk的候选片段
+        candidate_moments = generate_cross_chunk_candidate_moments(
+            pred_starts=all_pred_starts,
+            st_probs=all_st_probs,
+            ed_probs=all_ed_probs,
+            clip_length=clip_length
         )
 
-        # 获取真实片段（假设每个 query 对应一个真实片段）
-        gt_start = gt["short_memory_start"] + np.argmax(gt["start_label"])
-        gt_end = gt["short_memory_start"] + np.argmax(gt["end_label"])
-        gt_span = (gt_start, gt_end)
+        # 获取该组的所有真实片段并去重
+        gt_spans_set = set()
+        for _, gt in group:
+            gt_start = gt["short_memory_start"] + np.argmax(gt["start_label"])
+            gt_end = gt["short_memory_start"] + np.argmax(gt["end_label"])
+            if gt_start < gt_end:
+                gt_spans_set.add((gt_start, gt_end))
+        gt_spans = list(gt_spans_set)
 
-        # print("frame pred: gt:",gt_span," sub: ",candidate_moments)
-        # input("please wait")
+        # #   打印当前的candidate_moments和gt_spans
+        # print("当前的candidate_moments和gt_spans:")
+        # print("candidate_moments:", candidate_moments)
+        # print("gt_spans:", gt_spans)
+        # print("key:", key)
+        # input("请按回车键继续...")
 
-        # 计算该 query 的 R@n, IoU=m
+        # 计算该组的 R@n, IoU=m
         for n in n_list:
             for m in iou_thresholds:
                 topn_moments = candidate_moments[:n]
-                max_iou = max(calculate_iou(k, gt_span) for k in topn_moments)
-                if max_iou >= m:
-                    r_at_n_metrics[f"R@{n},IoU={m}"] += 1
+                # 对每个真实片段计算最大IoU
+                for gt_span in gt_spans:
+                    max_iou = max(calculate_iou(k, gt_span) for k in topn_moments)
+                    if max_iou >= m:
+                        r_at_n_metrics[f"R@{n},IoU={m}"] += 1
+                        break  # 只要有一个真实片段满足条件就可以
 
     # 转换为百分比
-    total_queries = len(matched_data)
+    total_queries = len(matched_data_grouped)
     for k in r_at_n_metrics:
         r_at_n_metrics[k] = round(r_at_n_metrics[k] / total_queries * 100, 2) if total_queries > 0 else 0.0
 
@@ -617,6 +669,64 @@ def calculate_iou(pred_span, gt_span):
     intersection = max(0, min(pred_end, gt_end) - max(pred_start, gt_start))
     union = max(pred_end, gt_end) - min(pred_start, gt_start)
     return intersection / union if union > 0 else 0.0
+
+def generate_cross_chunk_candidate_moments(pred_starts, st_probs, ed_probs, clip_length, topk=100):
+    """
+    生成跨chunk的候选片段：
+    1. 根据多个chunk的 st_probs 和 ed_probs 生成候选 (start, end) 对
+    2. 考虑不同chunk之间的时间关系
+    3. 按置信度排序（st_prob * ed_prob）
+    4. 使用 NMS 去除重叠片段
+    
+    参数:
+        pred_starts: 每个预测概率对应的起始帧位置列表
+        st_probs: 所有chunk拼接后的开始概率列表
+        ed_probs: 所有chunk拼接后的结束概率列表
+        clip_length: 视频总帧数
+        topk: 返回的候选片段数量
+        
+    返回:
+        候选片段列表，每个元素为 (start, end) 元组
+    """
+    # 生成所有可能的候选
+    candidates = []
+    for i in range(len(st_probs)):
+        for j in range(i, len(ed_probs)):
+            if j - i >= 1:  # 至少持续1帧
+                conf = st_probs[i] * ed_probs[j]
+                start_global = pred_starts[i]  # 使用对应的全局起始位置
+                end_global = pred_starts[j]    # 使用对应的全局起始位置
+                
+                # 计算实际的结束位置（考虑到每个位置可能是不同chunk的起始位置）
+                # 这里假设每个位置的预测是针对该位置开始的帧
+                start_frame = start_global + i - pred_starts[i]
+                end_frame = end_global + j - pred_starts[j]
+                
+                # 确保片段在视频范围内
+                if 0 <= start_frame < end_frame < clip_length:
+                    candidates.append((start_frame, end_frame, conf))
+
+    # 按置信度降序排序
+    candidates.sort(key=lambda x: x[2], reverse=True)
+
+    # 非极大值抑制 (NMS)
+    keep = []
+    while candidates:
+        keep.append(candidates[0])
+        candidates = [c for c in candidates if 
+            calculate_iou((c[0], c[1]), (keep[-1][0], keep[-1][1])) < 0.5]
+    
+    res = [(start, end) for start, end, _ in keep[:topk]]
+
+    # 并打印前5个候选片段,再打印这几个片段的置信度（prob_st,prob_ed）
+    print("前5个候选片段:")
+    for i, (start, end) in enumerate(res[:5]):
+        print(f"  {i+1}. 起始帧: {start}, 结束帧: {end}, 持续时间: {end-start} 帧")
+        print(f"   置信度: prob_st={st_probs[i]}, prob_ed={ed_probs[j]}")
+    # 暂停程序
+    input("请按回车键继续...")
+
+    return res
 
 def generate_candidate_moments(pred_start, st_probs, ed_probs, clip_length, topk=100):
     """
