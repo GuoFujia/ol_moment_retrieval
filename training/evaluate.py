@@ -250,6 +250,31 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
                 if len(saliency_scores) == 0 or len(pred) == 0 or idx>=len(saliency_scores):
                     continue
 
+                # 获取当前样本的标签（添加类型检查）
+                try:
+                    start_label = targets['start_label'][idx] if torch.is_tensor(targets['start_label']) else targets['start_label']
+                    end_label = targets['end_label'][idx] if torch.is_tensor(targets['end_label']) else targets['end_label']
+                    semantic_label = targets['semantic_label'][idx] if torch.is_tensor(targets['semantic_label']) else targets['semantic_label']
+                    saliency_label = targets.get('saliency_label')
+                    if saliency_label is not None:
+                        saliency_label = saliency_label[idx] if torch.is_tensor(saliency_label) else saliency_label
+
+                    # 转换为numpy数组（如果需要）
+                    if torch.is_tensor(start_label):
+                        start_label = start_label.cpu().numpy()
+                    if torch.is_tensor(end_label):
+                        end_label = end_label.cpu().numpy()
+                    if torch.is_tensor(semantic_label):
+                        semantic_label = semantic_label.cpu().numpy()
+                    if torch.is_tensor(saliency_label):
+                        saliency_label = saliency_label.cpu().numpy()
+                except Exception as e:
+                    print(f"\nError processing labels for sample {idx}:")
+                    print(f"Error: {str(e)}")
+                    print("Targets content:", targets)
+                    input("发生错误，请查看上述信息，按回车继续...")
+                    continue
+
                 cur_chunk_pred = dict(
                     qid=meta["qid"],
                     query=meta["query"],
@@ -268,8 +293,31 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
                     pred_frame_prob=pred.tolist(),
                     pred_saliency_scores=saliency_scores[idx],
                 )
-            # print("cur_chunk_pred中的pred_saliency_scores是：",cur_chunk_pred["pred_saliency_scores"])
-            # input("按回车键继续...")
+
+            # # 打印当前样本的预测结果和标签
+            # print("\n" + "="*50)
+            # print("当前样本信息:")
+            # print(f"Query ID: {cur_chunk_pred['qid']}")
+            # print(f"Query: {cur_chunk_pred['query']}")
+            # print(f"Video ID: {cur_chunk_pred['vid']}")
+            # print(f"Chunk Start Position: {cur_chunk_pred['pred_start']}")
+            
+            # print("\n前5帧的标签和预测:")
+            # max_frames = min(5, len(start_label) if hasattr(start_label, '__len__') else 5)
+            # for i in range(max_frames):
+            #     print(f"Frame {i}:")
+            #     print(f"  - Start Label: {start_label[i] if hasattr(start_label, '__getitem__') else start_label}")
+            #     print(f"  - End Label: {end_label[i] if hasattr(end_label, '__getitem__') else end_label}")
+            #     print(f"  - Semantic Label: {semantic_label[i] if hasattr(semantic_label, '__getitem__') else semantic_label}")
+            #     if saliency_label is not None:
+            #         print(f"  - Saliency Label: {saliency_label[i] if hasattr(saliency_label, '__getitem__') else saliency_label}")
+            #     # print(f"  - 预测概率 (st,mid,ed,irre): {[round(p, 3) for p in cur_chunk_pred['pred_frame_prob']]}")
+            #     # print(f"  - 预测显著性分数: {round(cur_chunk_pred['pred_saliency_scores'], 3)}")
+            #     print(f"  - 预测概率 (st,mid,ed,irre): {cur_chunk_pred['pred_frame_prob']}")
+            #     print(f"  - 预测显著性分数: {cur_chunk_pred['pred_saliency_scores']}")
+            
+            # print("="*50)
+            # input("\n按回车键继续查看下一个样本...")
 
             mr_res.append(cur_chunk_pred)
 
@@ -289,7 +337,7 @@ def get_eval_res(epoch_i, model, eval_loader, opt, criterion):
     # eval_res, eval_loss_meters = compute_mr_results(epoch_i, model, eval_loader, opt, criterion)
 
     #   criterion暂时还没修改，先不用
-    eval_res, eval_loss_meters = compute_mr_results(epoch_i, model, eval_loader, opt, criterion=criterion) 
+    eval_res, eval_loss_meters = compute_mr_results(epoch_i, model, eval_loader, opt, criterion) 
     return eval_res, eval_loss_meters
 
 

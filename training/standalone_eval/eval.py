@@ -546,11 +546,11 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
                 cur_sub["pred_saliency_scores"].extend(next_sub["pred_saliency_scores"])
 
     # 打印部分匹配的gt和pred
-    print("部分匹配的gt和pred:")
-    for key in matched_data_grouped:
-        print(f"query: {key[0]}, video: {key[1]}")
-        for sub, gt in matched_data_grouped[key]:
-            print(f"gt: {gt['short_memory_start']}, pred: {sub['pred_start']}")
+    # print("部分匹配的gt和pred:")
+    # for key in matched_data_grouped:
+    #     print(f"query: {key[0]}, video: {key[1]}")
+    #     for sub, gt in matched_data_grouped[key]:
+    #         print(f"gt: {gt['short_memory_start']}, pred: {sub['pred_start']}")
     # input("请按回车键继续...")
 
     # ================== 2. 片段定位评估（R@n, IoU=m）==================
@@ -718,13 +718,13 @@ def generate_cross_chunk_candidate_moments(pred_starts, st_probs, ed_probs, clip
     
     res = [(start, end) for start, end, _ in keep[:topk]]
 
-    # 并打印前5个候选片段,再打印这几个片段的置信度（prob_st,prob_ed）
-    print("前5个候选片段:")
-    for i, (start, end) in enumerate(res[:5]):
-        print(f"  {i+1}. 起始帧: {start}, 结束帧: {end}, 持续时间: {end-start} 帧")
-        print(f"   置信度: prob_st={st_probs[i]}, prob_ed={ed_probs[j]}")
-    # 暂停程序
-    input("请按回车键继续...")
+    # # 并打印前5个候选片段,再打印这几个片段的置信度（prob_st,prob_ed）
+    # print("前5个候选片段:")
+    # for i, (start, end) in enumerate(res[:5]):
+    #     print(f"  {i+1}. 起始帧: {start}, 结束帧: {end}, 持续时间: {end-start} 帧")
+    #     print(f"   置信度: prob_st={st_probs[i]}, prob_ed={ed_probs[j]}")
+    # # 暂停程序
+    # input("请按回车键继续...")
 
     return res
 

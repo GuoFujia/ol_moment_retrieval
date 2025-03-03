@@ -123,9 +123,8 @@ class OLMomentDETR(nn.Module):
 
         """
 
-        #?#这里对queries的设置存疑，暂时设置为和short_memory_length相等
-        #lighthouse中把num_queries配置在base.yml文件了
-        self.num_queries=memory_len[1]
+        # 修改后：使用long+short memory的queries
+        self.num_queries = memory_len[0] + memory_len[1]  # long + short
 
         #   拼接音频特征
         if src_aud is not None:
@@ -159,7 +158,9 @@ class OLMomentDETR(nn.Module):
         #       但又不确定这样模型的逻辑对不对
         
         #   最后一层layer的输出
-        out = {'frame_pred' : self.frame_class_embed(hs)[-1]}   # (#layers, bsz, queries, 4) --> (bsz, queries, 4)
+        short_start = memory_len[0]
+        short_end = short_start + memory_len[1]
+        out = {'frame_pred': self.frame_class_embed(hs)[-1][:, short_start:short_end]}
         
         # print("模型的帧预测结果：{}".format(out["frame_pred"]))
 
@@ -223,12 +224,14 @@ class SetCriterionOl(nn.Module):
                 for b, target in enumerate(targets[label_type]):
                     if isinstance(target, dict) and "spans" in target:
                         spans = target["spans"]
+                        # 添加类型和有效性检查
                         if isinstance(spans, (np.ndarray, list)):
                             spans = torch.tensor(spans, dtype=torch.long, device=frame_labels.device)
                         
-                        # 设置对应位置的标签为1，同时将irre设为0
-                        frame_labels[b, spans, i] = 1.0
-                        frame_labels[b, spans, 3] = 0.0
+                        # 检查spans是否为空以及是否在有效范围内
+                        if spans.numel() > 0 and torch.all(spans < num_frames):
+                            frame_labels[b, spans, i] = 1.0
+                            frame_labels[b, spans, 3] = 0.0  # 将对应位置的irre设为0
         
         # 计算每个二分类的BCE损失
         losses = {}

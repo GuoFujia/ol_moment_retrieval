@@ -226,7 +226,7 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
                 stop_score = -metrics["saliency_mse"]  # 越小越好，取负值
             else:
                 # 对于其他数据集，使用片段定位的 R@1,IoU=0.5 作为停止分数
-                stop_score = metrics["R@1,IoU=0.5"]
+                stop_score = metrics["R@5,IoU=0.5"]
 
             # 如果当前分数优于之前的最佳分数，则保存模型
             if stop_score > prev_best_score:
