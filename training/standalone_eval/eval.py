@@ -500,8 +500,8 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
     def get_sort_key(item):
         return (item["qid"], item["vid"], item.get("pred_start", item.get("short_memory_start")))
 
-    print("submission:",submission)
-    input("请按回车键继续...")
+    # print("submission:",submission)
+    # input("请按回车键继续...")
 
     submission_sorted = sorted(submission, key=get_sort_key)
     ground_truth_sorted = sorted(ground_truth, key=get_sort_key)

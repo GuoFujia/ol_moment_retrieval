@@ -16,4 +16,9 @@
    模型在encoder中通过self-attention处理了包含long_memory和short_memory的所有输入信息，然后在decoder中，通过设置num_queries等于short_memory长度，**希望使**decoder专注于生成short_memory部分的表示。但是事实上，只是令num_queries等于short_memory长度，得到的表示只是长度与short_memory保持一致，事实上还是包含了long_memory和short_memory两部分的信息。就导致在后面的映射部分利用这些“污染”了的信息（包含了多余的long_memory的信息）映射short_memory的类别，这样可能是导致错误的原因。
 
    因此修改预测部分的逻辑，预测short_memory和long_memory，但是在输出时只输出short_memory部分的结果
+   
+   修改后没有发现性能明显变化……
+   
+5. 
 
+​		

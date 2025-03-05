@@ -1,6 +1,12 @@
 seed: 2023  # 上来帧预测准确值就72%了，好像看不出来收敛
 device: 'cuda'
 num_workers: 4
+# 这几个供ol模型初始化设置num_queries使用，需要与evaluate.py文件中的start_inferrence函数的dataset_config参数保持一致
+short_memory_len : 8
+long_memory_sample_len: 16
+future_memory_sample_len: 0
+num_queries: 24 # 24 = 8 + 16 
+
 
 lr: 0.0001
 lr_drop: 400
@@ -24,7 +30,6 @@ hidden_dim: 256
 input_dropout: 0.5
 dropout: 0.1
 nheads: 8
-num_queries: 8
 
 n_input_proj: 2
 saliency_margin: 0.2
@@ -36,7 +41,7 @@ span_loss_coef: 10
 giou_loss_coef: 1
 label_loss_coef: 4
 
-frame_loss_coef: 1
+frame_loss_coef: 5
 saliency_loss_coef: 5   
 loss_temporal_consistency: 5
 temporal_consistency_loss_coef: 5
@@ -55,3 +60,5 @@ aux_loss: True
 model_ema: False
 ema_decay: 0.9
 results_dir: results
+
+

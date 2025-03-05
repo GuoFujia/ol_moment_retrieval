@@ -374,7 +374,8 @@ class StartEndDataset(Dataset):
             future_memory_end=min(future_memory_end,self.data[chunk_info["anno_id"]]["duration"])
 
         model_inputs = dict()
-        model_inputs["short_memory_start"]=short_memory_start
+        #         model_inputs["short_memory_start"]=short_memory_start
+        model_inputs["short_memory_start"] = {"spans": short_memory_start}
         
         # 修改查询特征的处理
         if self.use_glove:
@@ -788,12 +789,35 @@ def start_end_collate_ol(batch):
     batch_meta = [e["meta"] for e in batch]
     model_inputs_keys = batch[0]["model_inputs"].keys()
     batched_data = dict()
-
+    
+    # 首先确定哪些样本是有效的
+    valid_indices = []
+    for i, item in enumerate(batch):
+        is_valid = True
+        # 检查视频特征
+        for feat_key in ["video_feat_long", "video_feat_short", "video_feat_future"]:
+            if feat_key in item["model_inputs"] and len(item["model_inputs"][feat_key]) == 0:
+                is_valid = False
+                break
+        # 检查查询特征
+        if "query_feat" in item["model_inputs"] and len(item["model_inputs"]["query_feat"]) == 0:
+            is_valid = False
+        
+        if is_valid:
+            valid_indices.append(i)
+    
+    # 只保留有效样本
+    valid_batch = [batch[i] for i in valid_indices]
+    valid_batch_meta = [batch_meta[i] for i in valid_indices]
+    
+    if len(valid_batch) == 0:
+        return [], {}
+    
+    # 处理所有特征
     for k in model_inputs_keys:
         if k == "query_feat":
-            # 收集所有查询特征
-            query_feats = [e["model_inputs"][k] for e in batch]
-            # 使用pad_sequences_1d处理变长序列
+            # 只处理有效样本的查询特征
+            query_feats = [e["model_inputs"][k] for e in valid_batch]
             padded_feats, mask = pad_sequences_1d(
                 query_feats,
                 dtype=torch.float32,
@@ -801,51 +825,50 @@ def start_end_collate_ol(batch):
             )
             batched_data[k] = (padded_feats, mask)
             continue
-
+        
         if k == "short_memory_start":
-            batched_data[k] = [dict(short_memory_start=e["model_inputs"][k]) for e in batch]
+            # 收集所有样本的short_memory_start
+            short_starts = [e["model_inputs"][k] for e in batch]
+            batched_data[k] = short_starts
             continue
-        if k == "start_label":
-            batched_data[k] = [dict(start_labels=e["model_inputs"][k]) for e in batch]
+
+        # 处理标签相关的特征
+        if k in ["start_label", "end_label", "semantic_label",
+                "future_start_label", "future_end_label", "future_semantic_label"]:
+            # label_key = k.replace("label", "labels")  # 处理命名差异
+            batched_data[k] = [dict(spans=e["model_inputs"][k]) for e in valid_batch]
             continue
-        if k == "end_label":
-            batched_data[k] = [dict(end_labels=e["model_inputs"][k]) for e in batch]
-            continue
-        if k == "semantic_label":
-            batched_data[k] = [dict(semantic_labels=e["model_inputs"][k]) for e in batch]
-            continue
-        if k == "future_start_label":
-            batched_data[k] = [dict(future_start_labels=e["model_inputs"][k]) for e in batch]
-            continue
-        if k == "future_end_label":
-            batched_data[k] = [dict(future_end_labels=e["model_inputs"][k]) for e in batch]
-            continue
-        if k == "future_semantic_label":
-            batched_data[k] = [dict(future_semantic_labels=e["model_inputs"][k]) for e in batch]
-            continue
+            
+        # 处理显著性相关的特征
         if k in ["saliency_pos_labels", "saliency_neg_labels"]:
-            # 跳过空样本
-            labels = [e["model_inputs"][k] for e in batch if len(e["model_inputs"][k]) > 0]
-            if len(labels) > 0:  # 如果有非空样本
+            labels = [e["model_inputs"][k] for e in valid_batch]
+            if len(labels) > 0:
                 batched_data[k] = torch.LongTensor(labels)
             continue
+            
         if k == "saliency_all_labels":
-            # 跳过空样本
-            saliency_labels = [e["model_inputs"][k] for e in batch if len(e["model_inputs"][k]) > 0]
-            if len(saliency_labels) > 0:  # 如果有非空样本
+            saliency_labels = [e["model_inputs"][k] for e in valid_batch]
+            if len(saliency_labels) > 0:
                 pad_data, mask_data = pad_sequences_1d(saliency_labels, dtype=np.float32, fixed_length=None)
                 batched_data[k] = torch.tensor(pad_data, dtype=torch.float32)
             continue
-
-        # 默认处理其他特征（填充变长序列）
+            
+        # 处理视频特征
         if k in ["video_feat_long", "video_feat_short", "video_feat_future"]:
-            valid_data = [e["model_inputs"][k] for e in batch if len(e["model_inputs"][k]) > 0]
+            valid_data = [e["model_inputs"][k] for e in valid_batch]
             if len(valid_data) > 0:
-                # 使用固定长度填充
                 max_len = max(len(x) for x in valid_data)
                 batched_data[k] = pad_sequences_1d(valid_data, dtype=torch.float32, fixed_length=max_len)
-
-    return batch_meta, batched_data
+            continue
+            
+        # 处理音频特征（如果有的话）
+        if k in ["audio_feat_long", "audio_feat_short", "audio_feat_future"]:
+            valid_data = [e["model_inputs"][k] for e in valid_batch]
+            if len(valid_data) > 0:
+                max_len = max(len(x) for x in valid_data)
+                batched_data[k] = pad_sequences_1d(valid_data, dtype=torch.float32, fixed_length=max_len)
+            continue
+    return valid_batch_meta, batched_data
 
 def prepare_batch_inputs(batched_model_inputs, device, non_blocking=False):
     # 初始化 memory_len
@@ -942,62 +965,48 @@ def prepare_batch_inputs(batched_model_inputs, device, non_blocking=False):
 
         model_inputs["src_aud"] = src_aud
         model_inputs["src_aud_mask"] = src_aud_mask
-
     # 构建 targets
     targets = {}
     if "short_memory_start" in batched_model_inputs:
         targets["short_memory_start"] = [
-            dict(spans=e["short_memory_start"])
+            dict(spans=e["spans"])
             for e in batched_model_inputs["short_memory_start"]
-            if "short_memory_start" in e  # 确保每个元素都有 "short_memory_start"
         ]
     
     if "start_label" in batched_model_inputs:
         targets["start_label"] = [
-            # dict(spans=e["start_labels"].to(device, non_blocking=non_blocking))
-            dict(spans=e["start_labels"])
+            dict(spans=e["spans"])
             for e in batched_model_inputs["start_label"]
-            if "start_labels" in e  # 确保每个元素都有 "start_label"
         ]
 
     if "end_label" in batched_model_inputs:
         targets["end_label"] = [
-            # dict(spans=e["end_labels"].to(device, non_blocking=non_blocking))
-            dict(spans=e["end_labels"])
+            dict(spans=e["spans"])
             for e in batched_model_inputs["end_label"]
-            if "end_labels" in e  # 确保每个元素都有 "end_label"
         ]
 
     if "semantic_label" in batched_model_inputs:
         targets["semantic_label"] = [
-            # dict(spans=e["semantic_labels"].to(device, non_blocking=non_blocking))
-            dict(spans=e["semantic_labels"])
+            dict(spans=e["spans"])
             for e in batched_model_inputs["semantic_label"]
-            if "semantic_labels" in e  # 确保每个元素都有 "semantic_label"
         ]
 
     if "future_start_label" in batched_model_inputs:
         targets["future_start_label"] = [
-            # dict(spans=e["future_start_labels"].to(device, non_blocking=non_blocking))
-            dict(spans=e["future_start_labels"])
+            dict(spans=e["spans"])
             for e in batched_model_inputs["future_start_label"]
-            if "spans" in e  # 确保每个元素都有 "future_start_label"
         ]
 
     if "future_end_label" in batched_model_inputs:
         targets["future_end_label"] = [
-            # dict(spans=e["future_end_labels"].to(device, non_blocking=non_blocking))
-            dict(spans=e["future_end_labels"])
+            dict(spans=e["spans"])
             for e in batched_model_inputs["future_end_label"]
-            if "spans" in e  # 确保每个元素都有 "future_end_label"
         ]
 
     if "future_semantic_label" in batched_model_inputs:
         targets["future_semantic_label"] = [
-            # dict(spans=e["future_semantic_labels"].to(device, non_blocking=non_blocking))
-            dict(spans=e["future_semantic_labels"])
+            dict(spans=e["spans"])
             for e in batched_model_inputs["future_semantic_label"]
-            if "spans" in e  # 确保每个元素都有 "future_semantic_label"
         ]
     if "saliency_pos_labels" in batched_model_inputs:
         # 过滤掉没有正样本或负样本的样本

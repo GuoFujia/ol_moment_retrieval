@@ -247,8 +247,15 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
         for idx, (meta, pred) in enumerate(zip(query_meta, frame_pred)):            
             if opt.dset_name in ['qvhighlight', 'qvhighlight_pretrain']:
 
-                if len(saliency_scores) == 0 or len(pred) == 0 or idx>=len(saliency_scores):
-                    continue
+                # if len(saliency_scores) == 0 or len(pred) == 0 or idx>=len(saliency_scores):
+                #     print("saliency_scores:",saliency_scores)
+                #     print("pred:",pred)
+                #     print("idx:",idx)
+                #     print("len(saliency_scores):",len(saliency_scores))
+                #     print("len(pred):",len(pred))
+                #     input("请按回车键继续...")
+
+                    # continue
 
                 # # 获取当前样本的标签（添加类型检查）
                 # try:
@@ -328,7 +335,7 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
             loss_dict["loss_overall"] = float(losses)
             for k, v in loss_dict.items():
                 loss_meters[k].update(float(v) * weight_dict[k] if k in weight_dict else float(v))
-    
+
     return mr_res, loss_meters
 
 

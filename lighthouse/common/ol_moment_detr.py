@@ -84,7 +84,7 @@ class OLMomentDETR(nn.Module):
         self.max_v_l = max_v_l
         span_pred_dim = 2 if span_loss_type == "l1" else max_v_l * 2
         self.span_embed = MLP(hidden_dim, hidden_dim, span_pred_dim, 3)
-        self.class_embed = nn.Linear(hidden_dim, 2)  # 0: background, 1: foreground
+        # self.class_embed = nn.Linear(hidden_dim, 2)  # 0: background, 1: foreground
 
         self.frame_class_embed = MLP(hidden_dim, hidden_dim, 4, 3)  # 输出维度仍为4，但表示4个二分类的logits
 
@@ -135,8 +135,8 @@ class OLMomentDETR(nn.Module):
         src_txt = self.input_txt_proj(src_txt)
         #   拼接视频和文本的特征，掩码
 
-        print("src_vid:",src_vid.shape,"src_txt:",src_txt.shape)
-        input("请按回车键继续...")
+        # print("src_vid:",src_vid.shape,"src_txt:",src_txt.shape)
+        # input("请按回车键继续...")
         
         src = torch.cat([src_vid, src_txt], dim=1)  # (bsz, L_vid+L_txt, d)
         mask = torch.cat([src_vid_mask, src_txt_mask], dim=1).bool()  # (bsz, L_vid+L_txt)
@@ -150,18 +150,8 @@ class OLMomentDETR(nn.Module):
         # (#layers, bsz, #queries, d), (bsz, L_vid+L_txt, d)
         #   通过transformer
         hs, memory = self.transformer(src, ~mask, self.query_embed.weight, pos)
+        # hs.shape = (num_decoder_layers, batch_size, num_queries, hidden_dim)
 
-        # outputs_class = self.class_embed(hs)  # (#layers, batch_size, #queries, #classes)
-        # outputs_coord = self.span_embed(hs)  # (#layers, bsz, #queries, 2 or max_v_l * 2)
-        # if self.span_loss_type == "l1":
-        #     outputs_coord = outputs_coord.sigmoid()
-        # out = {'pred_logits': outputs_class[-1], 'pred_spans': outputs_coord[-1]}
-
-        #   对帧作为st，mid，ed，irre的预测用一个预测头
-        #   这里-2维不是L_vid应该是有问题的，
-        #       我想着是应该把queries设置为short_memory_sample_length
-        #       但又不确定这样模型的逻辑对不对
-        
         #   使用掩码确定实际的long memory长度
         long_memory_mask = src_vid_mask[:, :memory_len[0]]
         actual_long_len = long_memory_mask.sum(dim=1).max().item()  # 获取batch中最长的有效长度
@@ -170,14 +160,14 @@ class OLMomentDETR(nn.Module):
         short_start = min(memory_len[0], actual_long_len)
         short_end = short_start + memory_len[1]
 
-        print("actual_long_len:",actual_long_len,"memory_len:",memory_len)
-        input("请按回车键继续...")
-        
         out = {'frame_pred': self.frame_class_embed(hs)[-1][:, short_start:short_end]}
-        
-        # print("模型的帧预测结果：{}".format(out["frame_pred"]))
 
-        # print("in forward length of frame_pred is {} like {}".format(len(out["frame_pred"][0]),out["frame_pred"][0]))
+
+        # print("actual_long_len:",actual_long_len,"memory_len:",memory_len)
+        # print("short_memory_start:",short_start)
+        # print("short_memory_end:",short_end)
+        # print("out['frame_pred']:",out['frame_pred'])
+        # input("请按回车键继续...")
 
         #   saliency score的计算可以沿用
         # txt_mem = memory[:, src_vid.shape[1]:]  # (bsz, L_txt, d)
@@ -235,6 +225,7 @@ class SetCriterionOl(nn.Module):
         for i, label_type in enumerate(label_types):
             if label_type in targets:
                 for b, target in enumerate(targets[label_type]):
+
                     if isinstance(target, dict) and "spans" in target:
                         spans = target["spans"]
                         # 添加类型和有效性检查
@@ -291,33 +282,56 @@ class SetCriterionOl(nn.Module):
 
     def loss_saliency(self, outputs, targets, indices, log=True):
         """显著性损失"""
-        if "saliency_scores" not in outputs or "saliency_pos_labels" not in targets:
+        if ("saliency_scores" not in outputs or 
+            "saliency_pos_labels" not in targets or 
+            "short_memory_start" not in targets):
             return {"loss_saliency": 0}
 
         saliency_scores = outputs["saliency_scores"]
         pos_indices = targets["saliency_pos_labels"]
         neg_indices = targets["saliency_neg_labels"]
-        short_memory_start = [item['spans'] for item in targets["short_memory_start"]]
-
+        
+        # 获取每个样本的short_memory_start
+        short_memory_starts = targets["short_memory_start"]
+        if not short_memory_starts:  # 安全检查
+            return {"loss_saliency": 0}
+        
+        # print("targets['short_memory_start']:",targets["short_memory_start"])
+        # print("short_memory_start:",short_memory_start)
+        # print("pos_indices:",pos_indices)
+        # print("neg_indices:",neg_indices)
+        # input("请按回车键继续...")
+        
         # 收集有效样本
         valid_pos_scores = []
         valid_neg_scores = []
         for i in range(len(pos_indices)):
-            current_start = short_memory_start[i]
-            pos_idx = pos_indices[i] - current_start
-            neg_idx = neg_indices[i] - current_start
-
-            if (0 <= pos_idx < saliency_scores.shape[1] and 
-                0 <= neg_idx < saliency_scores.shape[1]):
-                valid_pos_scores.append(saliency_scores[i, pos_idx])
-                valid_neg_scores.append(saliency_scores[i, neg_idx])
+            if i >= len(short_memory_starts):  # 安全检查
+                continue
+            
+            current_start = short_memory_starts[i]["spans"]  # 获取当前样本的short_memory_start
+            pos_idx = pos_indices[i]
+            neg_idx = neg_indices[i]
+            
+            # 跳过无效的索引
+            if pos_idx == -1 or neg_idx == -1:
+                continue
+            
+            # 转换为相对于short memory的局部索引
+            pos_idx_local = pos_idx - current_start
+            neg_idx_local = neg_idx - current_start
+            
+            if (0 <= pos_idx_local < saliency_scores.shape[1] and 
+                0 <= neg_idx_local < saliency_scores.shape[1]):
+                valid_pos_scores.append(saliency_scores[i, pos_idx_local])
+                valid_neg_scores.append(saliency_scores[i, neg_idx_local])
 
         if not valid_pos_scores or not valid_neg_scores:
             return {"loss_saliency": 0}
 
         valid_pos_scores = torch.stack(valid_pos_scores)
         valid_neg_scores = torch.stack(valid_neg_scores)
-
+        
         # 1. 基础对比损失
         base_loss = torch.clamp(
             self.saliency_margin + valid_neg_scores - valid_pos_scores, 
