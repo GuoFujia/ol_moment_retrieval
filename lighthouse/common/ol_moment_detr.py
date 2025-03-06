@@ -210,72 +210,40 @@ class SetCriterionOl(nn.Module):
         self.use_consistency_loss = use_consistency_loss
 
     def loss_labels(self, outputs, targets, indices, log=True):
-        """帧分类损失 - 修改为4个二分类"""
+        """修改后的帧分类损失函数"""
         frame_pred = outputs['frame_pred']  # (batch_size, num_frames, 4)
-        batch_size, num_frames, _ = frame_pred.shape
         
-        # 初始化4个二分类的标签
-        frame_labels = torch.zeros(batch_size, num_frames, 4, dtype=torch.float, device=frame_pred.device)
-        
-        # 设置标签 - 默认所有帧都是不相关的
-        frame_labels[:, :, 3] = 1.0  # 所有帧默认为irre=1
-        
-        # 设置其他标签
-        label_types = ["start_label", "semantic_label", "end_label"]
-        for i, label_type in enumerate(label_types):
-            if label_type in targets:
-                for b, target in enumerate(targets[label_type]):
-
-                    if isinstance(target, dict) and "spans" in target:
-                        spans = target["spans"]
-                        # 添加类型和有效性检查
-                        if isinstance(spans, (np.ndarray, list)):
-                            spans = torch.tensor(spans, dtype=torch.long, device=frame_labels.device)
-                        
-                        # 检查spans是否为空以及是否在有效范围内
-                        if spans.numel() > 0 and torch.all(spans < num_frames):
-                            frame_labels[b, spans, i] = 1.0
-                            frame_labels[b, spans, 3] = 0.0  # 将对应位置的irre设为0
-        
-        # 计算每个二分类的BCE损失
         losses = {}
         total_loss = 0
-        class_names = ["st", "mid", "ed", "irre"]
         
-        # 计算类别权重
-        pos_weights = []
-        for i in range(4):
-            # 计算每个类别的正样本比例
-            pos_count = frame_labels[:, :, i].sum()
-            total_count = batch_size * num_frames
-            # 计算正样本权重 (反比于正样本数量)
-            weight = total_count / (pos_count + 1e-6)
-            pos_weights.append(weight)
-        
-        pos_weights = torch.tensor(pos_weights, device=frame_pred.device)
-        
-        # 使用BCE with Logits Loss计算每个二分类的损失
-        for i in range(4):
-            loss_i = F.binary_cross_entropy_with_logits(
-                frame_pred[:, :, i], 
-                frame_labels[:, :, i],
-                pos_weight=pos_weights[i]
+        # 使用middle_label替代semantic_label
+        label_types = ['start_label', 'middle_label', 'end_label']
+        for i, label_type in enumerate(label_types):
+            target = targets[label_type].float()
+            pred = frame_pred[:, :, i]
+            
+            # 计算加权BCE损失
+            loss = F.binary_cross_entropy_with_logits(
+                pred, target, reduction='none'
             )
-            losses[f'loss_label_{class_names[i]}'] = loss_i
-            total_loss += loss_i
-        
-        losses['loss_label'] = total_loss / 4.0  # 平均损失
+            
+            # 动态权重
+            weight = (target * (1 - target)).pow(self.gamma)
+            loss = (loss * weight).mean()
+            
+            losses[f'loss_label_{label_type}'] = loss
+            total_loss += loss
         
         # 条件性添加时序平滑损失
         if self.use_consistency_loss:
             pred_probs = torch.sigmoid(frame_pred)  # 使用sigmoid获取概率
             temporal_smooth = torch.mean((pred_probs[:, 1:] - pred_probs[:, :-1]).pow(2))
-            losses['loss_label'] += 0.1 * temporal_smooth
+            losses['loss_label'] = total_loss / 3.0 + 0.1 * temporal_smooth
         
         if log:
             # 计算每个二分类的准确率
             pred_binary = (torch.sigmoid(frame_pred) > 0.5).float()
-            accuracy = (pred_binary == frame_labels).float().mean() * 100
+            accuracy = (pred_binary == target).float().mean() * 100
             losses['class_error'] = 100 - accuracy
         
         return losses
