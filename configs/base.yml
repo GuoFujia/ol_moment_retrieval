@@ -11,7 +11,7 @@ num_queries: 24 # 24 = 8 + 16
 lr: 0.0001
 lr_drop: 400
 wd: 0.0001
-n_epoch: 200
+n_epoch: 50
 max_es_cnt: 200
 bsz: 32
 eval_bsz: 100
@@ -41,7 +41,9 @@ span_loss_coef: 10
 giou_loss_coef: 1
 label_loss_coef: 4
 
-frame_loss_coef: 5
+start_label_loss_coef: 10
+middle_label_loss_coef: 10
+end_label_loss_coef: 10
 saliency_loss_coef: 5   
 loss_temporal_consistency: 5
 temporal_consistency_loss_coef: 5

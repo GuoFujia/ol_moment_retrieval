@@ -474,7 +474,7 @@ def eval_submission_ol(submission, ground_truth, saliency_scores_all, verbose=Tr
             pred_saliency_scores.extend(sub["pred_saliency_scores"])
             sample_st=gt["short_memory_start"]
             sample_ed=sample_st+len(gt["start_label"])
-            gt_saliency_score=saliency_scores_all[gt["vid"]][sample_st:sample_ed]
+            gt_saliency_score=saliency_scores_all[gt["vid"],gt["qid"]][sample_st:sample_ed]
             gt_saliency_scores.extend(gt_saliency_score)
 
         # 计算回归指标
@@ -633,7 +633,7 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
                 
                 # 获取ground truth分数
                 ed = st + len(pred_scores_chunk)  # 使用预测分数的长度来确定结束位置
-                gt_scores_chunk = saliency_scores_all[vid][st:ed]
+                gt_scores_chunk = saliency_scores_all[vid,gt["qid"]][st:ed]
                 
                 # 确保长度匹配
                 min_len = min(len(pred_scores_chunk), len(gt_scores_chunk))

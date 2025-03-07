@@ -131,7 +131,8 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i):
     for batch_idx, batch in tqdm(enumerate(train_loader),
                                  desc="Training Iteration",
                                  total=num_training_examples):
-        model_inputs, targets = batch_input_fn(batch[1], opt.device)
+        metas, batched_inputs = batch
+        model_inputs, targets = batch_input_fn(metas,batched_inputs, opt.device)
         
         if opt.model_name == 'taskweave':
             model_inputs['epoch_i'] = epoch_i  # taskweave 需要 epoch 编号
@@ -144,11 +145,17 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i):
             outputs = model(**model_inputs)  
             total_loss, loss_dict = criterion(outputs, targets)
             losses = sum(loss_dict[k] * criterion.weight_dict[k] for k in loss_dict.keys() if k in criterion.weight_dict)
-            
-            if opt.model_name == 'tr_detr' \
-                and (opt.dset_name != 'tvsum' and opt.dset_name != 'youtube_highlight' 
-                    and opt.dset_name != 'qvhighlight_pretrain'):
-                losses += additional_trdetr_losses(model_inputs, outputs, targets, opt)
+               
+            # print("total_loss",total_loss)
+            # print("loss_dict",loss_dict)
+            # print("weight_dict",criterion.weight_dict)
+            # print("losses",losses)
+            # input("linggangu")
+
+            # if opt.model_name == 'tr_detr' \
+            #     and (opt.dset_name != 'tvsum' and opt.dset_name != 'youtube_highlight' 
+            #         and opt.dset_name != 'qvhighlight_pretrain'):
+            #     losses += additional_trdetr_losses(model_inputs, outputs, targets, opt)
             
             optimizer.zero_grad()
             losses.backward()

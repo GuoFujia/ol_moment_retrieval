@@ -119,6 +119,9 @@ def compute_hl_results(epoch_i, model, eval_loader, opt, criterion=None):
     topk = 5 # top-5 map
 
     for batch in tqdm(eval_loader, desc="compute st ed scores"):
+        metas, batched_inputs = batch
+        model_inputs, targets = batch_input_fn(metas, batched_inputs, opt.device)
+
         query_meta = batch[0]
         model_inputs, targets = batch_input_fn(batch[1], opt.device)
 
@@ -208,8 +211,12 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
 
     mr_res = []
     for batch in tqdm(eval_loader, desc="compute probability for each frame as st ed or mid"):
-        query_meta = batch[0]
-        model_inputs, targets = batch_input_fn(batch[1], opt.device)
+         # batch 是一个元组，包含 metas 和 model_inputs
+        metas, batched_inputs = batch  # 解包 batch
+        model_inputs, targets = batch_input_fn(metas, batched_inputs, opt.device)  # 正确传递所有参数
+        
+        # query_meta = batch[0]
+        # model_inputs, targets = batch_input_fn(batch[1], opt.device)
 
         #   获得模型输出
         if opt.model_name == 'taskweave':
@@ -221,7 +228,8 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
         # saliency scores
         _saliency_scores = outputs["saliency_scores"].half()  # (bsz, short_memory_length)
         
-        # print("看看模型输出的显著性分数是什么1：",_saliency_scores)
+        # print("看看模型输出的是什么1：",outputs)
+        # input("hhhhhhhhhhhhhh")
         
         saliency_scores = []
 
@@ -242,45 +250,14 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
 
         # compose predictions
         frame_pred = outputs["frame_pred"].cpu()    # (bsz,#queries,4), queries设置存疑
-        frame_pred = F.softmax(frame_pred, -1)
+        frame_pred = torch.sigmoid(frame_pred)
+
+        # print("in com mr res: ",frame_pred)
+        # input("  ds  ")
+
         
-        for idx, (meta, pred) in enumerate(zip(query_meta, frame_pred)):            
+        for idx, (meta, pred) in enumerate(zip(metas, frame_pred)):            
             if opt.dset_name in ['qvhighlight', 'qvhighlight_pretrain']:
-
-                # if len(saliency_scores) == 0 or len(pred) == 0 or idx>=len(saliency_scores):
-                #     print("saliency_scores:",saliency_scores)
-                #     print("pred:",pred)
-                #     print("idx:",idx)
-                #     print("len(saliency_scores):",len(saliency_scores))
-                #     print("len(pred):",len(pred))
-                #     input("请按回车键继续...")
-
-                    # continue
-
-                # # 获取当前样本的标签（添加类型检查）
-                # try:
-                #     start_label = targets['start_label'][idx] if torch.is_tensor(targets['start_label']) else targets['start_label']
-                #     end_label = targets['end_label'][idx] if torch.is_tensor(targets['end_label']) else targets['end_label']
-                #     semantic_label = targets['semantic_label'][idx] if torch.is_tensor(targets['semantic_label']) else targets['semantic_label']
-                #     saliency_label = targets.get('saliency_label')
-                #     if saliency_label is not None:
-                #         saliency_label = saliency_label[idx] if torch.is_tensor(saliency_label) else saliency_label
-
-                #     # 转换为numpy数组（如果需要）
-                #     if torch.is_tensor(start_label):
-                #         start_label = start_label.cpu().numpy()
-                #     if torch.is_tensor(end_label):
-                #         end_label = end_label.cpu().numpy()
-                #     if torch.is_tensor(semantic_label):
-                #         semantic_label = semantic_label.cpu().numpy()
-                #     if torch.is_tensor(saliency_label):
-                #         saliency_label = saliency_label.cpu().numpy()
-                # except Exception as e:
-                #     print(f"\nError processing labels for sample {idx}:")
-                #     print(f"Error: {str(e)}")
-                #     print("Targets content:", targets)
-                #     input("发生错误，请查看上述信息，按回车继续...")
-                #     continue
 
                 cur_chunk_pred = dict(
                     qid=meta["qid"],
@@ -301,30 +278,8 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
                     pred_saliency_scores=saliency_scores[idx],
                 )
 
-            # # 打印当前样本的预测结果和标签
-            # print("\n" + "="*50)
-            # print("当前样本信息:")
-            # print(f"Query ID: {cur_chunk_pred['qid']}")
-            # print(f"Query: {cur_chunk_pred['query']}")
-            # print(f"Video ID: {cur_chunk_pred['vid']}")
-            # print(f"Chunk Start Position: {cur_chunk_pred['pred_start']}")
-            
-            # print("\n前5帧的标签和预测:")
-            # max_frames = min(5, len(start_label) if hasattr(start_label, '__len__') else 5)
-            # for i in range(max_frames):
-            #     print(f"Frame {i}:")
-            #     print(f"  - Start Label: {start_label[i] if hasattr(start_label, '__getitem__') else start_label}")
-            #     print(f"  - End Label: {end_label[i] if hasattr(end_label, '__getitem__') else end_label}")
-            #     print(f"  - Semantic Label: {semantic_label[i] if hasattr(semantic_label, '__getitem__') else semantic_label}")
-            #     if saliency_label is not None:
-            #         print(f"  - Saliency Label: {saliency_label[i] if hasattr(saliency_label, '__getitem__') else saliency_label}")
-            #     # print(f"  - 预测概率 (st,mid,ed,irre): {[round(p, 3) for p in cur_chunk_pred['pred_frame_prob']]}")
-            #     # print(f"  - 预测显著性分数: {round(cur_chunk_pred['pred_saliency_scores'], 3)}")
-            #     print(f"  - 预测概率 (st,mid,ed,irre): {cur_chunk_pred['pred_frame_prob']}")
-            #     print(f"  - 预测显著性分数: {cur_chunk_pred['pred_saliency_scores']}")
-            
-            # print("="*50)
-            # input("\n按回车键继续查看下一个样本...")
+            # print(cur_chunk_pred)
+            # input("hhhhhhhhhhhhhhhhh")
 
             mr_res.append(cur_chunk_pred)
 

@@ -160,8 +160,13 @@ class OLMomentDETR(nn.Module):
         short_start = min(memory_len[0], actual_long_len)
         short_end = short_start + memory_len[1]
 
-        out = {'frame_pred': self.frame_class_embed(hs)[-1][:, short_start:short_end]}
+        # # 将logits转换为概率
+        # frame_logits = self.frame_class_embed(hs)[-1][:, short_start:short_end]  # (batch_size, num_frames, 4)
+        # frame_probs = torch.sigmoid(frame_logits)
+        
+        # out = {'frame_pred': frame_probs}
 
+        out = {'frame_pred': self.frame_class_embed(hs)[-1][:, short_start:short_end]}
 
         # print("actual_long_len:",actual_long_len,"memory_len:",memory_len)
         # print("short_memory_start:",short_start)
@@ -184,6 +189,8 @@ class OLMomentDETR(nn.Module):
         #     out['aux_outputs'] = [
         #         {'pred_logits': a, 'pred_spans': b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
+        # print("out:",out)
+
         return out
 
 class SetCriterionOl(nn.Module):
@@ -195,19 +202,21 @@ class SetCriterionOl(nn.Module):
         要用这个的话, 就得改一下saliency部分的逻辑
     """
 
-    def __init__(self, weight_dict, losses, saliency_margin=1, use_consistency_loss=True):
+    def __init__(self, weight_dict, losses, saliency_margin=1, use_consistency_loss=True, gamma=3):
         """ Create the criterion.
         Parameters:
             weight_dict: dict containing as key the names of the losses and as values their relative weight.
             losses: list of all the losses to be applied. See get_loss for list of available losses.
             saliency_margin: float, margin for saliency loss.
             use_consistency_loss: bool, whether to use consistency loss.
+            gamma: float, weight factor for hard sample mining in label loss.
         """
         super().__init__()
         self.weight_dict = weight_dict
         self.losses = losses
         self.saliency_margin = saliency_margin
         self.use_consistency_loss = use_consistency_loss
+        self.gamma = gamma  # 添加 gamma 作为初始化参数
 
     def loss_labels(self, outputs, targets, indices, log=True):
         """修改后的帧分类损失函数"""
@@ -220,39 +229,61 @@ class SetCriterionOl(nn.Module):
         label_types = ['start_label', 'middle_label', 'end_label']
         for i, label_type in enumerate(label_types):
             target = targets[label_type].float()
-            pred = frame_pred[:, :, i]
+            frame_probs = torch.sigmoid(frame_pred)
+            pred = frame_probs[:, :, i]
             
+
+
+            # print("loss type: ", label_type)
+            # print("pred: ", pred)
+            # print("target: ",target)
+            # input("wait")
+
             # 计算加权BCE损失
             loss = F.binary_cross_entropy_with_logits(
                 pred, target, reduction='none'
             )
             
             # 动态权重
-            weight = (target * (1 - target)).pow(self.gamma)
+            weight = (target * (1 - target)).pow(self.gamma)  # 使用 gamma 计算权重
             loss = (loss * weight).mean()
             
-            losses[f'loss_label_{label_type}'] = loss
+            losses[f'loss_{label_type}'] = loss
             total_loss += loss
         
         # 条件性添加时序平滑损失
         if self.use_consistency_loss:
-            pred_probs = torch.sigmoid(frame_pred)  # 使用sigmoid获取概率
+            pred_probs = torch.sigmoid(pred)  # 使用sigmoid获取概率
             temporal_smooth = torch.mean((pred_probs[:, 1:] - pred_probs[:, :-1]).pow(2))
             losses['loss_label'] = total_loss / 3.0 + 0.1 * temporal_smooth
         
         if log:
-            # 计算每个二分类的准确率
-            pred_binary = (torch.sigmoid(frame_pred) > 0.5).float()
-            accuracy = (pred_binary == target).float().mean() * 100
-            losses['class_error'] = 100 - accuracy
+
+            # print("pred: ",torch.sigmoid(pred))
+            # print("target: ",target)
+
+            # 计算每个二分类的预测概率率
+            pred_binary = torch.sigmoid(pred)
+
+            # print("pred_bin: ",pred_binary)
+            # print("target: ",target)
+
+            # accuracy = (pred_binary == target).float().mean() * 100
+            # losses['class_error'] = 100 - accuracy
+
         
         return losses
 
     def loss_saliency(self, outputs, targets, indices, log=True):
         """显著性损失"""
+
+        # print("target",targets.keys())
+        # input("wait")
+
         if ("saliency_scores" not in outputs or 
             "saliency_pos_labels" not in targets or 
             "short_memory_start" not in targets):
+            print("infolacked to compute loss saliency")
             return {"loss_saliency": 0}
 
         saliency_scores = outputs["saliency_scores"]
@@ -260,15 +291,7 @@ class SetCriterionOl(nn.Module):
         neg_indices = targets["saliency_neg_labels"]
         
         # 获取每个样本的short_memory_start
-        short_memory_starts = targets["short_memory_start"]
-        if not short_memory_starts:  # 安全检查
-            return {"loss_saliency": 0}
-        
-        # print("targets['short_memory_start']:",targets["short_memory_start"])
-        # print("short_memory_start:",short_memory_start)
-        # print("pos_indices:",pos_indices)
-        # print("neg_indices:",neg_indices)
-        # input("请按回车键继续...")
+        short_memory_starts = targets["short_memory_start"]["spans"]
         
         # 收集有效样本
         valid_pos_scores = []
@@ -276,8 +299,11 @@ class SetCriterionOl(nn.Module):
         for i in range(len(pos_indices)):
             if i >= len(short_memory_starts):  # 安全检查
                 continue
+
+            # print("short_memory_starts",short_memory_starts)
+            # input("wait")
             
-            current_start = short_memory_starts[i]["spans"]  # 获取当前样本的short_memory_start
+            current_start = short_memory_starts[i]  # 获取当前样本的short_memory_start
             pos_idx = pos_indices[i]
             neg_idx = neg_indices[i]
             
@@ -317,6 +343,9 @@ class SetCriterionOl(nn.Module):
             )
             loss += smooth_loss
 
+        # print("sal loss ",loss)
+        # input("wait")
+
         return {
             "loss_saliency": loss
         }
@@ -352,10 +381,13 @@ class SetCriterionOl(nn.Module):
             losses.update(self.loss_temporal_consistency(outputs, targets, indices=None))
 
         # Weighted sum of losses
+
+        # print("weight_dict",self.weight_dict)
+        # print("losses.keys",losses.keys())
+        # input("wait")
+
         total_loss = sum(losses[k] * self.weight_dict.get(k, 1.0) for k in losses.keys())
         return total_loss, losses
-
-
 
 
 class MLP(nn.Module):
@@ -433,7 +465,9 @@ def build_model(args):
 
     # 定义 weight_dict，确保与 SetCriterionOl 中的损失项匹配
     weight_dict = {
-        "loss_label": args.frame_loss_coef,  # 帧分类损失的权重
+        "loss_start_label": args.start_label_loss_coef,  # 帧分类损失的权重
+        "loss_middle_label": args.middle_label_loss_coef,  
+        "loss_end_label": args.end_label_loss_coef,  
         "loss_saliency": args.saliency_loss_coef,   # 显著性分数损失的权重
     }
     # 如果使用一致性损失，为weight_dict添加"loss_temporal_consistency"

@@ -231,8 +231,8 @@ class StartEndDataset(Dataset):
                 duration_frame = math.ceil(line["duration"] * self.fps)
                 all_vid_scores = np.zeros(duration_frame, dtype=float)
                 for windows in line["relevant_windows"]:
-                    start_frame = math.ceil(windows[0] * self.fps)-1
-                    end_frame = math.ceil(windows[1] * self.fps)-1
+                    start_frame = math.floor(windows[0] * self.fps)
+                    end_frame = math.floor(windows[1] * self.fps)
                     all_vid_scores[start_frame:end_frame] = 1
                 self.saliency_scores_list[(line["vid"],line["qid"])]= all_vid_scores
                 
@@ -279,7 +279,7 @@ class StartEndDataset(Dataset):
             # 计算目标片段位置
             gt_windows = line["relevant_windows"]
             for idx, windows in enumerate(gt_windows):
-                    gt_windows[idx] = [math.ceil(windows[0] * self.fps)-1, math.ceil(windows[1] * self.fps)-1]
+                    gt_windows[idx] = [math.floor(windows[0] * self.fps), math.floor(windows[1] * self.fps)]
                 
 
             # 确定chunk的起始位置
@@ -327,96 +327,81 @@ class StartEndDataset(Dataset):
                         boundary = [short_memory_start, 
                                   short_memory_start + self.short_memory_sample_length]
                                 
-                        try:
-                            if 'qvhighlight' in self.dset_name:
-                                if "subs_train" in self.data_path:
-                                    # 处理多个窗口，取最大值作为最终标签
-                                    all_saliency_labels = []
-                                    for gt_window in chunk_info["gt_windows"]:
-                                        labels = self.get_saliency_labels_sub_as_query(
-                                            boundary, 
-                                            gt_window,  # 传入单个窗口
-                                            self.short_memory_sample_length
-                                        )
-                                        if labels is not None:
-                                            all_saliency_labels.append(labels)
-                                    
-                                    # 如果没有有效标签，跳过这个chunk
-                                    if not all_saliency_labels:
-                                        continue
-                                        
-                                    # 合并所有窗口的标签（取最大值）
-                                    saliency_labels = (
-                                        max(l[0] for l in all_saliency_labels),  # pos_labels
-                                        max(l[1] for l in all_saliency_labels),  # neg_labels
-                                        np.maximum.reduce([l[2] for l in all_saliency_labels])  # all_labels
-                                    )
-                                else:
-                                    scores_key = (chunk_info["vid"], chunk_info["qid"])
-                                    if scores_key not in self.saliency_scores_list:
-                                        print(f"Warning: No saliency scores found for {scores_key}")
-                                        continue
-                                    
-                                    # 对每个gt window生成saliency label，取最大值
-                                    all_saliency_labels = []
-                                    for gt_window in chunk_info["gt_windows"]:
-                                        try:
-                                            labels = self.get_saliency_labels_all(
-                                                gt_window,
-                                                self.saliency_scores_list[scores_key],
-                                                boundary
-                                            )
-                                            if labels is not None:
-                                                all_saliency_labels.append(labels)
-                                        except Exception as e:
-                                            print(f"Error generating saliency labels for window {gt_window}: {str(e)}")
-                                            continue
-                                    
-                                    if not all_saliency_labels:
-                                        continue
-                                        
-                                    saliency_labels = (
-                                        max(l[0] for l in all_saliency_labels),
-                                        max(l[1] for l in all_saliency_labels),
-                                        max(l[2] for l in all_saliency_labels)
-                                    )
-                                    
-                            elif self.dset_name in ['charades', 'tacos', 'activitynet', 
-                                                  'clotho-moment', 'unav100-subset', 'tut2017']:
-                                # 同样处理多个窗口
-                                all_saliency_labels = []
-                                for gt_window in chunk_info["gt_windows"]:
-                                    labels = self.get_saliency_labels_sub_as_query(
-                                        boundary,
-                                        gt_window,  # 使用正确的gt_window而不是不存在的gt
-                                        self.short_memory_sample_length
-                                    )
-                                    if labels is not None:
-                                        all_saliency_labels.append(labels)
+                        if 'qvhighlight' in self.dset_name and "sub_train" not in self.dset_name:
+                            scores_key = (chunk_info["vid"], chunk_info["qid"])
+                            if scores_key not in self.saliency_scores_list:
+                                continue
+                            
+                            saliency_labels = self.get_saliency_labels_all(
+                                chunk_info["gt_windows"],  # 直接传入所有 GT 窗口
+                                self.saliency_scores_list[scores_key],
+                                boundary
+                            )
+                            # scores_key = (chunk_info["vid"], chunk_info["qid"])
+                            # if scores_key not in self.saliency_scores_list:
+                            #     print(f"Warning: No saliency scores found for {scores_key}")
+                            #     continue
+                            
+                            # # 对每个gt window生成saliency label，取最大值
+                            # all_saliency_labels = []
+                            # for gt_window in chunk_info["gt_windows"]:
+                            #     labels = self.get_saliency_labels_all(
+                            #             gt_window,
+                            #             self.saliency_scores_list[scores_key],
+                            #             boundary
+                            #         )
+                            #     if labels is not None:
+                            #         all_saliency_labels.append(labels)
+                            
+                            # if not all_saliency_labels:
+                            #     continue
                                 
-                                if not all_saliency_labels:
-                                    continue
-                                    
-                                saliency_labels = (
-                                    max(l[0] for l in all_saliency_labels),
-                                    max(l[1] for l in all_saliency_labels),
-                                    np.maximum.reduce([l[2] for l in all_saliency_labels])
-                                )
-                            else:
-                                raise NotImplementedError
+                            # saliency_labels = (
+                            #     max(l[0] for l in all_saliency_labels),
+                            #     max(l[1] for l in all_saliency_labels),
+                            #     max(l[2] for l in all_saliency_labels)
+                            # )
+                                
+                        elif self.dset_name in ['charades', 'tacos', 'activitynet', 
+                                                'clotho-moment', 'unav100-subset', 'tut2017']:
+                            saliency_labels = self.get_saliency_labels_sub_as_query(
+                                boundary,
+                                chunk_info["gt_windows"],  # 直接传入所有 GT 窗口
+                                self.short_memory_sample_length
+                            )
+                        #     # 同样处理多个窗口
+                        #     all_saliency_labels = []
+                        #     for gt_window in chunk_info["gt_windows"]:
+                        #         labels = self.get_saliency_labels_sub_as_query(
+                        #             boundary,
+                        #             gt_window,  # 使用正确的gt_window而不是不存在的gt
+                        #             self.short_memory_sample_length
+                        #         )
+                        #         if labels is not None:
+                        #             all_saliency_labels.append(labels)
                             
-                            if saliency_labels is None:
-                                continue  # 跳过saliency标签无效的chunk
-                            
-                            chunk_info.update({
-                                "saliency_pos_labels": saliency_labels[0],
-                                "saliency_neg_labels": saliency_labels[1],
-                                "saliency_all_labels": saliency_labels[2]
-                            })
-                            
-                        except Exception as e:
-                            print(f"Error generating saliency labels for vid={chunk_info['vid']}: {str(e)}")
+                        #     if not all_saliency_labels:
+                        #         continue
+                                
+                        #     saliency_labels = (
+                        #         max(l[0] for l in all_saliency_labels),
+                        #         max(l[1] for l in all_saliency_labels),
+                        #         np.maximum.reduce([l[2] for l in all_saliency_labels])
+                        #     )
+                        else:
+                            raise NotImplementedError
+                        
+                        # if saliency_labels is None:
+                        #     continue  # 跳过saliency标签无效的chunk
+                        
+                        if saliency_labels is None:
                             continue
+
+                        chunk_info.update({
+                            "saliency_pos_labels": saliency_labels[0],
+                            "saliency_neg_labels": saliency_labels[1],
+                            "saliency_all_labels": saliency_labels[2]
+                            })
 
                     # print("chunk_info:", chunk_info)
                     # input("Press Enter to continue...") 
@@ -658,14 +643,14 @@ class StartEndDataset(Dataset):
             if 'qvhighlight' in self.dset_name:
                 if "subs_train" in self.data_path: # for pretraining
                     model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
-                        self.get_saliency_labels_sub_as_query(boundary,chunk_info["gt"], self.short_memory_sample_length)
+                        self.get_saliency_labels_sub_as_query(boundary,chunk_info["gt_windows"], self.short_memory_sample_length)
                 else:
                     model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
-                        self.get_saliency_labels_all(chunk_info["gt"],self.saliency_scores_list[chunk_info["vid"]],boundary)                        
+                        self.get_saliency_labels_all(chunk_info["gt_windows"],self.saliency_scores_list[chunk_info["vid"],chunk_info["qid"]],boundary)                        
             
             elif self.dset_name in ['charades', 'tacos', 'activitynet', 'clotho-moment', 'unav100-subset', 'tut2017']:
                 model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
-                    self.get_saliency_labels_sub_as_query(boundary,chunk_info["gt"], self.short_memory_sample_length)
+                    self.get_saliency_labels_sub_as_query(boundary,chunk_info["gt_windows"], self.short_memory_sample_length)
             else:
                 raise NotImplementedError
         #   或者这里返回的字典里可以直接用chunk_info
@@ -723,139 +708,318 @@ class StartEndDataset(Dataset):
 
     #     return pos_clip_indices, neg_clip_indices, score_array
 
-    def get_saliency_labels_sub_as_query(self, boundary, gt_frame_boundary, ctx_l, max_n=1):
-        gt_st = gt_frame_boundary[0]
-        gt_ed = gt_frame_boundary[1]
+    # def get_saliency_labels_sub_as_query(self, boundary, gt_frame_boundary, ctx_l, max_n=1):
+    #     gt_st = gt_frame_boundary[0]
+    #     gt_ed = gt_frame_boundary[1]
 
-        st = boundary[0]
-        ed = boundary[1]
+    #     st = boundary[0]
+    #     ed = boundary[1]
 
-        # 计算 boundary 和 gt_frame_boundary 的交集
-        intersect_st = max(st, gt_st)
-        intersect_ed = min(ed, gt_ed)
+    #     # 计算 boundary 和 gt_frame_boundary 的交集
+    #     intersect_st = max(st, gt_st)
+    #     intersect_ed = min(ed, gt_ed)
 
-        # 如果交集有效（即 intersect_st <= intersect_ed），则将其作为 pos_pool
-        if intersect_st <= intersect_ed:
-            pos_pool = list(range(int(intersect_st), int(intersect_ed) + 1))  # 转换为整数
-        else:
-            pos_pool = []
+    #     # 如果交集有效（即 intersect_st <= intersect_ed），则将其作为 pos_pool
+    #     if intersect_st <= intersect_ed:
+    #         pos_pool = list(range(int(intersect_st), int(intersect_ed) + 1))  # 转换为整数
+    #     else:
+    #         pos_pool = []
 
-        # boundary 的其余部分作为 neg_pool
-        neg_pool = list(range(int(st), int(intersect_st))) + list(range(int(intersect_ed) + 1, int(ed) + 1))  # 转换为整数
+    #     # boundary 的其余部分作为 neg_pool
+    #     neg_pool = list(range(int(st), int(intersect_st))) + list(range(int(intersect_ed) + 1, int(ed) + 1))  # 转换为整数
 
-        # 从 pos_pool 中随机选择 max_n 个正样本
-        if len(pos_pool) >= max_n:
-            pos_clip_indices = random.sample(pos_pool, k=max_n)
-        else:
-            pos_clip_indices = pos_pool  # 如果 pos_pool 不足，则全部选择
+    #     # 从 pos_pool 中随机选择 max_n 个正样本
+    #     if len(pos_pool) >= max_n:
+    #         pos_clip_indices = random.sample(pos_pool, k=max_n)
+    #     else:
+    #         pos_clip_indices = pos_pool  # 如果 pos_pool 不足，则全部选择
 
-        # 从 neg_pool 中随机选择 max_n 个负样本
-        try:
-            neg_clip_indices = random.sample(neg_pool, k=max_n)
-        except:
-            neg_clip_indices = pos_clip_indices  # 如果 neg_pool 不足，则使用 pos_clip_indices
+    #     # 从 neg_pool 中随机选择 max_n 个负样本
+    #     try:
+    #         neg_clip_indices = random.sample(neg_pool, k=max_n)
+    #     except:
+    #         neg_clip_indices = pos_clip_indices  # 如果 neg_pool 不足，则使用 pos_clip_indices
 
-        # 如果正样本或负样本不足，用 -1 填充
-        if len(pos_clip_indices) < max_n:
-            pos_clip_indices.extend([-1] * (max_n - len(pos_clip_indices)))
-        if len(neg_clip_indices) < max_n:
-            neg_clip_indices.extend([-1] * (max_n - len(neg_clip_indices)))
+    #     # 如果正样本或负样本不足，用 -1 填充
+    #     if len(pos_clip_indices) < max_n:
+    #         pos_clip_indices.extend([-1] * (max_n - len(pos_clip_indices)))
+    #     if len(neg_clip_indices) < max_n:
+    #         neg_clip_indices.extend([-1] * (max_n - len(neg_clip_indices)))
 
-        # 生成显著性评分数组
-        score_array = np.zeros(ctx_l)
-        if pos_pool:
-            score_array[pos_pool[0]:pos_pool[-1] + 1] = 1
+    #     # 生成显著性评分数组
+    #     score_array = np.zeros(ctx_l)
+    #     if pos_pool:
+    #         score_array[pos_pool[0]:pos_pool[-1] + 1] = 1
 
-        # print("在get_saliency_labels_sub_as_query中的计算结果是：")
-        # print("saliency_pos_labels:", pos_clip_indices)
-        # print("saliency_neg_labels:", neg_clip_indices)
+    #     # print("在get_saliency_labels_sub_as_query中的计算结果是：")
+    #     # print("saliency_pos_labels:", pos_clip_indices)
+    #     # print("saliency_neg_labels:", neg_clip_indices)
 
-        return pos_clip_indices, neg_clip_indices, score_array
-    #   区别于lighthouse，这里可能存在正样本或者负样本为空的情况
-    #   因为只对rel_clip进行了评分，而chunk可能和gt无交集，或者为gt的子集
-    #   返回的分数列表是boundary对应的区间的分数，如果在数据集中没有这部分的分数（不是relevant cilp）则分数为0
-    def get_saliency_labels_all(self, gt_boundary, gt_scores, boundary, max_n=1,):
+    #     return pos_clip_indices, neg_clip_indices, score_array
+    # #   区别于lighthouse，这里可能存在正样本或者负样本为空的情况
+    # #   因为只对rel_clip进行了评分，而chunk可能和gt无交集，或者为gt的子集
+    # #   返回的分数列表是boundary对应的区间的分数，如果在数据集中没有这部分的分数（不是relevant cilp）则分数为0
+    # def get_saliency_labels_all(self, gt_boundary, gt_scores, boundary, max_n=1,):
+    #     """
+    #     根据 gt_boundary 和 boundary 的关系，选择正样本和负样本，并生成显著性分数数组。
+
+    #     参数:
+    #         gt_boundary (list): GT 的帧边界 [st, ed]。
+    #         gt_scores (list): GT 范围内每一帧的显著性分数。
+    #         boundary (list): 当前查询的帧边界 [st, ed]。
+    #         ctx_l (int): 上下文长度（整个视频的帧数）。
+    #         max_n (int): 每个类别（正样本和负样本）中最多选取的帧数。
+    #         add_easy_negative (bool): 是否从非 GT 区域中随机选择负样本。
+
+    #     返回:
+    #         pos_clip_indices (list): 正样本的帧索引。
+    #         neg_clip_indices (list): 负样本的帧索引。
+    #         score_array (np.array): 显著性分数数组，长度为 ctx_l。
+    #     """
+    #     gt_st, gt_ed = gt_boundary
+    #     gt_st, gt_ed = int(gt_st), int(gt_ed)
+    #     st, ed = boundary
+
+    #     # 初始化正样本和负样本
+    #     pos_clip_indices = []
+    #     neg_clip_indices = []
+
+    #     # 计算 gt_boundary 和 boundary 的交集
+    #     intersect_st = int(max(gt_st, st))
+    #     intersect_ed = int(min(gt_ed, ed))
+
+    #     # 情况 1: gt_boundary 和 boundary 有交集，且 boundary 不是 gt_boundary 的子集
+    #     if intersect_st <= intersect_ed and (st < gt_st or ed > gt_ed):
+    #         # 取交集中分数最高的 max_n 个帧作为正样本
+    #         intersect_scores = gt_scores[intersect_st - gt_st:intersect_ed - gt_st + 1]
+    #         intersect_indices = list(range(intersect_st, intersect_ed + 1))
+    #         if len(intersect_scores) > 0:
+    #             top_n_indices = np.argsort(intersect_scores)[-max_n:]
+    #             pos_clip_indices = [intersect_indices[i] for i in top_n_indices]
+
+    #         # 从 boundary - gt_boundary 的部分随机取样 max_n 个作为负样本
+    #         neg_pool = list(range(st, gt_st)) + list(range(gt_ed + 1, ed + 1))
+    #         if len(neg_pool) >= max_n:
+    #             neg_clip_indices = random.sample(neg_pool, k=max_n)
+    #         else:
+    #             neg_clip_indices = neg_pool  # 如果数量不够，则取全部
+
+    #     # 情况 2: boundary 是 gt_boundary 的子集
+    #     elif st >= gt_st and ed <= gt_ed:
+    #         # 取 boundary 中分数最高的 max_n 个帧作为正样本
+    #         boundary_scores = gt_scores[st - gt_st:ed - gt_st + 1]
+    #         boundary_indices = list(range(st, ed + 1))
+    #         if len(boundary_scores) > 0:
+    #             top_n_indices = np.argsort(boundary_scores)[-max_n:]
+    #             pos_clip_indices = [boundary_indices[i] for i in top_n_indices]
+    #         # 负样本为 None
+    #         neg_clip_indices = []
+
+    #     # 情况 3: gt_boundary 和 boundary 无交集
+    #     else:
+    #         # 从 boundary 中随机取样 max_n 个作为负样本
+    #         neg_pool = list(range(st, ed + 1))
+    #         if len(neg_pool) >= max_n:
+    #             neg_clip_indices = random.sample(neg_pool, k=max_n)
+    #         else:
+    #             neg_clip_indices = neg_pool  # 如果数量不够，则取全部
+    #         # 正样本为 None
+    #         pos_clip_indices = []
+
+    #     # 如果正样本或负样本不足，用 -1 填充
+    #     if len(pos_clip_indices) < max_n:
+    #         pos_clip_indices.extend([-1] * (max_n - len(pos_clip_indices)))
+    #     if len(neg_clip_indices) < max_n:
+    #         neg_clip_indices.extend([-1] * (max_n - len(neg_clip_indices)))
+
+    #     # 生成显著性分数数组
+    #     score_array = np.zeros(boundary[1] - boundary[0] + 1)
+    #     if intersect_st <= intersect_ed:
+    #         # 将交集的分数设置为 gt_scores 中对应的值
+    #         score_array[intersect_st - st:intersect_ed - st + 1] = gt_scores[intersect_st - gt_st:intersect_ed - gt_st + 1]
+
+    #     return pos_clip_indices, neg_clip_indices, score_array
+    
+    def get_saliency_labels_sub_as_query(self, boundary, gt_windows, ctx_l, max_n=1):
+        """处理多个GT片段的显著性标签生成
+        Args:
+            boundary (list): [st, ed] 当前chunk的边界
+            gt_windows (list): 多个GT片段的列表，每个元素为 [st, ed]
+            ctx_l (int): chunk的长度
+            max_n (int): 每类（正/负样本）最多选择的样本数
         """
-        根据 gt_boundary 和 boundary 的关系，选择正样本和负样本，并生成显著性分数数组。
-
-        参数:
-            gt_boundary (list): GT 的帧边界 [st, ed]。
-            gt_scores (list): GT 范围内每一帧的显著性分数。
-            boundary (list): 当前查询的帧边界 [st, ed]。
-            ctx_l (int): 上下文长度（整个视频的帧数）。
-            max_n (int): 每个类别（正样本和负样本）中最多选取的帧数。
-            add_easy_negative (bool): 是否从非 GT 区域中随机选择负样本。
-
-        返回:
-            pos_clip_indices (list): 正样本的帧索引。
-            neg_clip_indices (list): 负样本的帧索引。
-            score_array (np.array): 显著性分数数组，长度为 ctx_l。
-        """
-        gt_st, gt_ed = gt_boundary
-        gt_st, gt_ed = int(gt_st), int(gt_ed)
+        all_pos_pools = []
+        all_neg_pools = []
         st, ed = boundary
-
-        # 初始化正样本和负样本
-        pos_clip_indices = []
-        neg_clip_indices = []
-
-        # 计算 gt_boundary 和 boundary 的交集
-        intersect_st = int(max(gt_st, st))
-        intersect_ed = int(min(gt_ed, ed))
-
-        # 情况 1: gt_boundary 和 boundary 有交集，且 boundary 不是 gt_boundary 的子集
-        if intersect_st <= intersect_ed and (st < gt_st or ed > gt_ed):
-            # 取交集中分数最高的 max_n 个帧作为正样本
-            intersect_scores = gt_scores[intersect_st - gt_st:intersect_ed - gt_st + 1]
-            intersect_indices = list(range(intersect_st, intersect_ed + 1))
-            if len(intersect_scores) > 0:
-                top_n_indices = np.argsort(intersect_scores)[-max_n:]
-                pos_clip_indices = [intersect_indices[i] for i in top_n_indices]
-
-            # 从 boundary - gt_boundary 的部分随机取样 max_n 个作为负样本
-            neg_pool = list(range(st, gt_st)) + list(range(gt_ed + 1, ed + 1))
-            if len(neg_pool) >= max_n:
-                neg_clip_indices = random.sample(neg_pool, k=max_n)
-            else:
-                neg_clip_indices = neg_pool  # 如果数量不够，则取全部
-
-        # 情况 2: boundary 是 gt_boundary 的子集
-        elif st >= gt_st and ed <= gt_ed:
-            # 取 boundary 中分数最高的 max_n 个帧作为正样本
-            boundary_scores = gt_scores[st - gt_st:ed - gt_st + 1]
-            boundary_indices = list(range(st, ed + 1))
-            if len(boundary_scores) > 0:
-                top_n_indices = np.argsort(boundary_scores)[-max_n:]
-                pos_clip_indices = [boundary_indices[i] for i in top_n_indices]
-            # 负样本为 None
-            neg_clip_indices = []
-
-        # 情况 3: gt_boundary 和 boundary 无交集
-        else:
-            # 从 boundary 中随机取样 max_n 个作为负样本
-            neg_pool = list(range(st, ed + 1))
-            if len(neg_pool) >= max_n:
-                neg_clip_indices = random.sample(neg_pool, k=max_n)
-            else:
-                neg_clip_indices = neg_pool  # 如果数量不够，则取全部
-            # 正样本为 None
-            pos_clip_indices = []
-
-        # 如果正样本或负样本不足，用 -1 填充
-        if len(pos_clip_indices) < max_n:
-            pos_clip_indices.extend([-1] * (max_n - len(pos_clip_indices)))
-        if len(neg_clip_indices) < max_n:
-            neg_clip_indices.extend([-1] * (max_n - len(neg_clip_indices)))
-
-        # 生成显著性分数数组
-        score_array = np.zeros(boundary[1] - boundary[0] + 1)
-        if intersect_st <= intersect_ed:
-            # 将交集的分数设置为 gt_scores 中对应的值
-            score_array[intersect_st - st:intersect_ed - st + 1] = gt_scores[intersect_st - gt_st:intersect_ed - gt_st + 1]
-
+        
+        # 对每个GT窗口计算正负样本池
+        for gt_window in gt_windows:
+            gt_st, gt_ed = gt_window
+            
+            # 计算交集
+            intersect_st = max(st, gt_st)
+            intersect_ed = min(ed, gt_ed)
+            
+            # 收集正样本池
+            if intersect_st <= intersect_ed:
+                all_pos_pools.extend(list(range(int(intersect_st), int(intersect_ed) + 1)))
+                
+            # 收集负样本池
+            curr_neg_pool = list(range(int(st), int(intersect_st))) + \
+                        list(range(int(intersect_ed) + 1, int(ed) + 1))
+            all_neg_pools.extend(curr_neg_pool)
+        
+        # 去重
+        all_pos_pools = list(set(all_pos_pools))
+        all_neg_pools = list(set(all_neg_pools) - set(all_pos_pools))  # 确保负样本不在正样本中
+        
+        # 选择样本
+        pos_clip_indices = random.sample(all_pos_pools, k=min(max_n, len(all_pos_pools))) if all_pos_pools else []
+        neg_clip_indices = random.sample(all_neg_pools, k=min(max_n, len(all_neg_pools))) if all_neg_pools else []
+        
+        # 填充到固定长度
+        pos_clip_indices.extend([-1] * (max_n - len(pos_clip_indices)))
+        neg_clip_indices.extend([-1] * (max_n - len(neg_clip_indices)))
+        
+        # 生成分数数组
+        score_array = np.zeros(ctx_l)
+        for pos_range in all_pos_pools:
+            if pos_range - st < ctx_l:  # 确保索引在范围内
+                score_array[pos_range - st] = 1
+                
         return pos_clip_indices, neg_clip_indices, score_array
+
+    # def get_saliency_labels_all(self, gt_windows, gt_scores, boundary, max_n=1):
+    #     """处理多个GT片段的显著性标签生成（带分数）
+    #     Args:
+    #         gt_windows (list): 多个GT片段的列表，每个元素为 [st, ed]
+    #         gt_scores (np.array): 整个视频的显著性分数
+    #         boundary (list): [st, ed] 当前chunk的边界
+    #         max_n (int): 每类（正/负样本）最多选择的样本数
+    #     """
+    #     st, ed = boundary
+    #     all_pos_indices = []
+    #     all_pos_scores = []
+    #     all_neg_indices = []
+        
+    #     # 对每个GT窗口处理
+    #     for gt_window in gt_windows:
+    #         gt_st, gt_ed = map(int, gt_window)
+            
+    #         # 计算交集
+    #         intersect_st = int(max(gt_st, st))
+    #         intersect_ed = int(min(gt_ed, ed))
+            
+    #         if intersect_st <= intersect_ed:
+    #             # 收集正样本及其分数
+    #             curr_scores = gt_scores[intersect_st - gt_st:intersect_ed - gt_st + 1]
+    #             curr_indices = list(range(intersect_st, intersect_ed + 1))
+    #             all_pos_indices.extend(curr_indices)
+    #             all_pos_scores.extend(curr_scores)
+                
+    #             # 收集负样本
+    #             curr_neg = list(range(st, gt_st)) + list(range(gt_ed + 1, ed + 1))
+    #             all_neg_indices.extend(curr_neg)
+        
+    #     # 去重并选择分数最高的正样本
+    #     if all_pos_indices:
+    #         pos_pairs = list(zip(all_pos_indices, all_pos_scores))
+    #         pos_pairs = sorted(set(pos_pairs), key=lambda x: x[1], reverse=True)
+    #         pos_clip_indices = [p[0] for p in pos_pairs[:max_n]]
+    #     else:
+    #         pos_clip_indices = []
+        
+    #     # 去重并随机选择负样本
+    #     all_neg_indices = list(set(all_neg_indices) - set(all_pos_indices))
+    #     neg_clip_indices = random.sample(all_neg_indices, k=min(max_n, len(all_neg_indices))) if all_neg_indices else []
+        
+    #     # 填充到固定长度
+    #     pos_clip_indices.extend([-1] * (max_n - len(pos_clip_indices)))
+    #     neg_clip_indices.extend([-1] * (max_n - len(neg_clip_indices)))
+        
+    #     # 生成分数数组
+    #     score_array = np.zeros(ed - st + 1)
+    #     try:
+    #         for gt_window in gt_windows:
+    #             gt_st, gt_ed = map(int, gt_window)
+    #             intersect_st = int(max(gt_st, st))
+    #             intersect_ed = int(min(gt_ed, ed))
+    #             if intersect_st <= intersect_ed:
+    #                 score_array[intersect_st - st:intersect_ed - st + 1] = \
+    #                     gt_scores[intersect_st - gt_st:intersect_ed - gt_st + 1]
+    #     except  Exception as e :
+    #         print("看一下现在的这几个边界量:st,ed,gtst,gted,inst,ined, ", st, ed, gt_st, gt_ed, intersect_st, intersect_ed)
+    #         print(intersect_st - st,intersect_ed - st + 1,intersect_st - gt_st,intersect_ed - gt_st + 1)
+    #         print(e)
+        
+    #     return pos_clip_indices, neg_clip_indices, score_array
     
-    
+    def get_saliency_labels_all(self, gt_windows, gt_scores, boundary, max_n=1):
+        st, ed = map(int, boundary)
+        all_pos_indices = []
+        all_pos_scores = []
+        all_neg_indices = []
+        
+        # 生成分数数组
+        score_array = np.zeros(ed - st + 1)
+        
+        try:
+            for gt_window in gt_windows:
+                gt_st, gt_ed = map(int, gt_window)
+                
+                # 计算交集
+                intersect_st = int(max(gt_st, st))
+                intersect_ed = int(min(gt_ed, ed))
+                
+                if intersect_st <= intersect_ed:
+                    # 确保索引范围有效
+                    src_start = max(0, intersect_st - gt_st)
+                    src_end = min(len(gt_scores), intersect_ed - gt_st + 1)
+                    dst_start = max(0, intersect_st - st)
+                    dst_end = min(len(score_array), intersect_ed - st + 1)
+                    
+                    # 确保源和目标长度相同
+                    length = min(src_end - src_start, dst_end - dst_start)
+                    if length > 0:
+                        score_array[dst_start:dst_start + length] = \
+                            gt_scores[src_start:src_start + length]
+                        
+                        # 收集正样本及其分数
+                        curr_scores = gt_scores[src_start:src_start + length]
+                        curr_indices = list(range(intersect_st, intersect_st + length))
+                        all_pos_indices.extend(curr_indices)
+                        all_pos_scores.extend(curr_scores)
+                    
+                    # 收集负样本
+                    curr_neg = list(range(st, gt_st)) + list(range(gt_ed + 1, ed + 1))
+                    all_neg_indices.extend(curr_neg)
+                    
+        except Exception as e:
+            print(f"Error in get_saliency_labels_all: {str(e)}")
+            print(f"Boundary: {st}, {ed}")
+            print(f"GT window: {gt_st}, {gt_ed}")
+            print(f"Intersection: {intersect_st}, {intersect_ed}")
+            print(f"Array shapes - score_array: {len(score_array)}, gt_scores: {len(gt_scores)}")
+            return [], [], np.zeros(ed - st + 1)
+        
+        # 去重并选择分数最高的正样本
+        if all_pos_indices:
+            pos_pairs = list(zip(all_pos_indices, all_pos_scores))
+            pos_pairs = sorted(set(pos_pairs), key=lambda x: x[1], reverse=True)
+            pos_clip_indices = [p[0] for p in pos_pairs[:max_n]]
+        else:
+            pos_clip_indices = []
+        
+        # 去重并随机选择负样本
+        all_neg_indices = list(set(all_neg_indices) - set(all_pos_indices))
+        neg_clip_indices = random.sample(all_neg_indices, k=min(max_n, len(all_neg_indices))) if all_neg_indices else []
+        
+        # 填充到固定长度
+        pos_clip_indices.extend([-1] * (max_n - len(pos_clip_indices)))
+        neg_clip_indices.extend([-1] * (max_n - len(neg_clip_indices)))
+        
+        return pos_clip_indices, neg_clip_indices, score_array
+
     def get_span_labels(self, windows, ctx_l):
         """
         windows: list([st, ed]) in seconds. E.g. [[26, 36]], corresponding st_ed clip_indices [[13, 17]] (inclusive)
@@ -988,9 +1152,41 @@ def start_end_collate_ol(batch):
     batched_model_inputs = {}
     for key in model_inputs_list[0].keys():
         if isinstance(model_inputs_list[0][key], torch.Tensor):
-            batched_model_inputs[key] = torch.stack([
-                inputs[key] for inputs in model_inputs_list
-            ])
+            # batched_model_inputs[key] = torch.stack([
+            #     inputs[key] for inputs in model_inputs_list
+            # ])
+             # 获取当前key下所有tensor的shape
+            tensors = [inputs[key] for inputs in model_inputs_list]
+            shapes = [t.shape for t in tensors]
+            
+            # 检查是否需要padding
+            if len(shapes[0]) == 2:  # 只处理2D张量
+                max_dim0 = max(s[0] for s in shapes)
+                max_dim1 = max(s[1] for s in shapes)
+                
+                padded_tensors = []
+                for tensor in tensors:
+                    if tensor.shape[0] < max_dim0 or tensor.shape[1] < max_dim1:
+                        # 创建填充后的张量
+                        padded = torch.zeros(max_dim0, max_dim1,
+                                          dtype=tensor.dtype,
+                                          device=tensor.device)
+                        # 复制原始数据
+                        padded[:tensor.shape[0], :tensor.shape[1]] = tensor
+                        padded_tensors.append(padded)
+                    else:
+                        padded_tensors.append(tensor)
+                
+                try:
+                    batched_model_inputs[key] = torch.stack(padded_tensors)
+                except Exception as e:
+                    print(f"Error stacking tensors for key {key}")
+                    print(f"Tensor shapes: {[t.shape for t in padded_tensors]}")
+                    raise e
+            else:
+                # 对于非2D张量，直接尝试stack
+                batched_model_inputs[key] = torch.stack(tensors)
+
         elif isinstance(model_inputs_list[0][key], dict):
             # 处理嵌套字典，如short_memory_start
             batched_model_inputs[key] = {
@@ -1054,21 +1250,42 @@ def prepare_batch_inputs(metas, batched_model_inputs, device, non_blocking=False
     })
     
     # 4. 处理memory长度信息
+
+    vid_feat_long = batched_model_inputs.get('video_feat_long', None)
+    vid_feat_future = batched_model_inputs.get('video_feat_future', None)
+
     model_inputs['memory_len'] = [
-        batched_model_inputs.get('video_feat_long', torch.tensor([])).shape[1],
+        vid_feat_long.shape[1] if vid_feat_long is not None else 0,
         batched_model_inputs['video_feat_short'].shape[1],
-        batched_model_inputs.get('video_feat_future', torch.tensor([])).shape[1]
+        vid_feat_future.shape[1] if vid_feat_future is not None else 0,
     ]
     
     # 5. 处理标签
+    # targets = {}
+    # label_keys = [
+    #     'start_label', 'middle_label', 'end_label',
+    #     'saliency_pos_labels', 'saliency_neg_labels', 'saliency_all_labels'
+    # ]
+    # for key in label_keys:
+    #     if key in batched_model_inputs:
+    #         targets[key] = batched_model_inputs[key].to(device, non_blocking=non_blocking)
+    
     targets = {}
     label_keys = [
-        'start_label', 'middle_label', 'end_label',
+        'start_label', 'middle_label', 'end_label',"short_memory_start",
         'saliency_pos_labels', 'saliency_neg_labels', 'saliency_all_labels'
     ]
     for key in label_keys:
         if key in batched_model_inputs:
-            targets[key] = batched_model_inputs[key].to(device, non_blocking=non_blocking)
+            # 检查数据类型并相应处理
+            if isinstance(batched_model_inputs[key], torch.Tensor):
+                targets[key] = batched_model_inputs[key].to(device, non_blocking=non_blocking)
+            elif isinstance(batched_model_inputs[key], list):
+                # 如果是列表，先转换为张量再移动到设备
+                # targets[key] = torch.tensor(batched_model_inputs[key], device=device)
+                targets[key] = torch.tensor(np.array(batched_model_inputs[key]), device=device)
+            else:
+                targets[key] = batched_model_inputs[key]
     
     # 6. 添加meta信息（如果需要）
     targets['meta'] = metas
