@@ -490,12 +490,10 @@ def eval_submission_ol(submission, ground_truth, saliency_scores_all, verbose=Tr
 
 def eval_submission_ol_2(submission, ground_truth, saliency_scores_all, 
                       verbose=True, match_number=True, n_list=(1, 5), iou_thresholds=(0.5, 0.7)):
-    """
-    修改说明：
-    1. 删除帧级分类指标（st/mid/ed分类）
-    2. 新增基于片段定位的 R@n, IoU=m 评估逻辑
-    3. 保留显著性回归评估
-    """
+  
+    # print(f"[DEBUG] eval_submission_ol_2 - Submission length: {len(submission)}, Ground truth length: {len(ground_truth)}")
+    # print(f"[DEBUG] First few submission qids: {[d['qid'] for d in submission[:5]]}")
+    # print(f"[DEBUG] First few ground truth qids: {[d['qid'] for d in ground_truth[:5]]}")
     # ================== 1. 数据对齐 ==================
     def get_sort_key(item):
         return (item["qid"], item["vid"], item.get("pred_start", item.get("short_memory_start")))
@@ -556,6 +554,69 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
     #         print(f"gt: {gt['short_memory_start']}, pred: {sub['pred_start']}")
     # input("请按回车键继续...")
 
+    # ================== 1.5. 添加8个列表用于存储预测值和真实值 ==================
+    pred_st_probs = []  # 预测的帧作为st的概率
+    pred_mid_probs = []  # 预测的帧作为mid的概率
+    pred_ed_probs = []  # 预测的帧作为ed的概率
+    pred_saliency_scores = []  # 预测的帧的显著性分数
+    gt_st_labels = []  # 真实的帧作为st的标签
+    gt_mid_labels = []  # 真实的帧作为mid的标签
+    gt_ed_labels = []  # 真实的帧作为ed的标签
+    gt_saliency_scores = []  # 真实的帧的显著性分数
+
+    # 遍历每组数据，填充上述8个列表
+    for key, group in matched_data_grouped.items():
+        for sub, gt in group:
+            # 获取预测的概率和显著性分数
+            pred_st_probs.extend(np.array(sub["pred_frame_prob"])[:, 0])
+            pred_mid_probs.extend(np.array(sub["pred_frame_prob"])[:, 1])
+            pred_ed_probs.extend(np.array(sub["pred_frame_prob"])[:, 2])
+            # pred_st_probs.append(sub["pred_frame_prob"][0])
+            # pred_mid_probs.append(sub["pred_frame_prob"][1])
+            # pred_ed_probs.append(sub["pred_frame_prob"][2])
+            if "pred_saliency_scores" in sub:
+                pred_saliency_scores.extend(sub["pred_saliency_scores"])
+
+            # 获取真实的标签和显著性分数
+            gt_st_labels.extend(gt["start_label"])
+            gt_mid_labels.extend(gt["middle_label"])
+            gt_ed_labels.extend(gt["end_label"])
+            vid = gt["vid"]
+            st = gt["short_memory_start"]
+            ed = st + len(sub["pred_frame_prob"])
+            gt_saliency_scores.extend(saliency_scores_all[vid, gt["qid"]][st:ed])
+
+    # print("传入的submission长度：", len(submission))
+    # print("matched_data长度：", len(matched_data))
+    # print("matched_data_grouped长度：", len(matched_data_grouped))
+
+    # print("submission:", submission[:5])
+    # input("请按回车键继续...")
+    # print("submission:", submission)
+
+    # print("ground_truth:", ground_truth[:5])
+    # input("请按回车键继续...")
+    # print("ground_truth:", ground_truth)
+
+    # print("matched_data_grouped:", matched_data_grouped)
+    # input("请按回车键继续...")
+
+    # print("matched_data:", matched_data[:10])
+    # input("请按回车键继续...")
+
+    # print("pred_st_probs:", pred_st_probs[:5])
+    # print("gt_st_labels:", gt_st_labels[:5])
+
+    # print("pred_mid_probs:", pred_mid_probs[:5])
+    # print("gt_mid_labels:", gt_mid_labels[:5])
+
+    # print("pred_ed_probs:", pred_ed_probs[:5])
+    # print("gt_ed_labels:", gt_ed_labels[:5])
+
+    # print("pred_saliency_scores:", pred_saliency_scores[:5])
+    # print("gt_saliency_scores:", gt_saliency_scores[:5])
+    # input("请按回车键继续...")
+
     # ================== 2. 片段定位评估（R@n, IoU=m）==================
     r_at_n_metrics = OrderedDict()
     for n in n_list:
@@ -575,7 +636,10 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
         for sub, _ in group:
             all_st_probs.extend(np.array(sub["pred_frame_prob"])[:, 0])
             all_ed_probs.extend(np.array(sub["pred_frame_prob"])[:, 2])
+            # all_st_probs.extend(np.array(sub["pred_frame_prob"])[0])
+            # all_ed_probs.extend(np.array(sub["pred_frame_prob"])[2])
             all_pred_starts.extend([sub["pred_start"]] * len(sub["pred_frame_prob"]))
+            all_pred_starts = [x + 8 for x in all_pred_starts]
 
         # 生成跨chunk的候选片段
         candidate_moments = generate_cross_chunk_candidate_moments(

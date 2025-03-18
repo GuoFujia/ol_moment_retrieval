@@ -1,0 +1,24 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python: Evaluate Script",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/training/evaluate.py",  // 指定脚本路径
+            "args": [
+                "--model", "ol_moment_detr",
+                "--dataset", "qvhighlight",
+                "--feature", "clip_slowfast",
+                "--split", "val",
+                "--model_path", "training/results/ol_moment_detr/qvhighlight/clip_slowfast/best.ckpt",
+                "--eval_path", "/home/gfj/lighthouse-main/data/qvhighlight/highlight_val_release.jsonl"
+            ],
+            "cwd": "${workspaceFolder}",  // 设置工作目录
+            "console": "integratedTerminal"  // 在 VSCode 内置终端中运行
+        }
+    ]
+}

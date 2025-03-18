@@ -210,13 +210,12 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
     loss_meters = defaultdict(AverageMeter)
 
     mr_res = []
+    # print(f"[DEBUG] Starting compute_mr_results with {len(eval_loader)} batches")
     for batch in tqdm(eval_loader, desc="compute probability for each frame as st ed or mid"):
          # batch 是一个元组，包含 metas 和 model_inputs
+
         metas, batched_inputs = batch  # 解包 batch
         model_inputs, targets = batch_input_fn(metas, batched_inputs, opt.device)  # 正确传递所有参数
-        
-        # query_meta = batch[0]
-        # model_inputs, targets = batch_input_fn(batch[1], opt.device)
 
         #   获得模型输出
         if opt.model_name == 'taskweave':
@@ -228,9 +227,14 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
         # saliency scores
         _saliency_scores = outputs["saliency_scores"].half()  # (bsz, short_memory_length)
         
-        # print("看看模型输出的是什么1：",outputs)
-        # input("hhhhhhhhhhhhhh")
-        
+        # if not model.training:
+        #     # 非训练模式：saliency_scores 的形状是 (bsz,)
+        #     # 将其扩展为 (bsz, 1) 以匹配后续逻辑
+        #     _saliency_scores = _saliency_scores.unsqueeze(-1)  # (bsz, 1)
+        # else:
+        #     # 训练模式：saliency_scores 的形状是 (bsz, short_memory_length)
+        #     pass  # 无需修改
+
         saliency_scores = []
 
         short_st = model_inputs["memory_len"][0]
@@ -238,15 +242,19 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
         src_vid_mask_short = model_inputs["src_vid_mask"][:, short_st:short_ed]  # 保留batch维度
         valid_vid_lengths = src_vid_mask_short.sum(1).cpu().tolist()
 
+        # print("in compute mr results, model's output length is :",outputs["frame_pred"].shape)
+        # print("first 5 outputs frame_pred:", outputs["frame_pred"][:5])
+        # print("first 5 outputs saliency_scores:", outputs["saliency_scores"][:5])
+        # print("first 5 chunk idx:", model_inputs["chunk_idx"][:5])
+        # print("first 5 memory len:", model_inputs["memory_len"][:5])
+        # print("first 5 src vid mask:", model_inputs["src_vid_mask"][:5])
+        # print("valid_vid_lengths", valid_vid_lengths)
+        # input("press enter to continue...")
+
         for j in range(len(valid_vid_lengths)):
             valid_length = int(valid_vid_lengths[j])
             if valid_length > 0:  # 添加有效性检查
                 saliency_scores.append(_saliency_scores[j, :valid_length].tolist())
-
-        # print("看看模型输出的显著性分数是什么2：",saliency_scores,"valid_vid_lengths的长度是",valid_vid_lengths,
-        #       "src_vid_mask_short是：",src_vid_mask_short)
-
-
 
         # compose predictions
         frame_pred = outputs["frame_pred"].cpu()    # (bsz,#queries,4), queries设置存疑
@@ -257,9 +265,7 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
 
         
         for idx, (meta, pred) in enumerate(zip(metas, frame_pred)):            
-            if opt.dset_name in ['qvhighlight', 'qvhighlight_pretrain']:
-
-                cur_chunk_pred = dict(
+            cur_chunk_pred = dict(
                     qid=meta["qid"],
                     query=meta["query"],
                     vid=meta["vid"],
@@ -267,19 +273,6 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
                     pred_frame_prob=pred.tolist(),
                     pred_saliency_scores=saliency_scores[idx],
                 )
-            else:
-                # anet, charades
-                cur_chunk_pred = dict(
-                    qid=meta["qid"],
-                    query=meta["query"],
-                    vid=meta["vid"],
-                    pred_start=meta["short_memory_start"],
-                    pred_frame_prob=pred.tolist(),
-                    pred_saliency_scores=saliency_scores[idx],
-                )
-
-            # print(cur_chunk_pred)
-            # input("hhhhhhhhhhhhhhhhh")
 
             mr_res.append(cur_chunk_pred)
 
@@ -291,6 +284,8 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
             for k, v in loss_dict.items():
                 loss_meters[k].update(float(v) * weight_dict[k] if k in weight_dict else float(v))
 
+    print(f"[DEBUG] Finished compute_mr_results with {len(mr_res)} predictions")
+    # input("check mr_res len...")
     return mr_res, loss_meters
 
 
@@ -409,7 +404,7 @@ def start_inference(opt, domain=None):
         long_memory_stride=1,
         future_memory_stride=1,
         load_future_memory=False,
-        test_mode=False,    #val不算是test，还要加载标签来着
+        test_mode=True,    
     )
     
     # eval_dataset = CGDETR_StartEndDataset(**dataset_config) if opt.model_name == 'cg_detr' else StartEndDataset(**dataset_config)

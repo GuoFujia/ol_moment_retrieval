@@ -15,6 +15,7 @@ n_epoch: 50
 max_es_cnt: 200
 bsz: 32
 eval_bsz: 100
+# eval_bsz: 32
 grad_clip: 0.1
 max_q_l: 32
 max_v_l: 75

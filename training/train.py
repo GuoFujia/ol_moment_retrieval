@@ -232,8 +232,8 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
             # 如果数据集是 tvsum 或 youtube_highlight，使用 saliency_mse 作为停止分数
                 stop_score = -metrics["saliency_mse"]  # 越小越好，取负值
             else:
-                # 对于其他数据集，使用片段定位的 R@1,IoU=0.5 作为停止分数
-                stop_score = metrics["R@5,IoU=0.5"]
+                # 对于其他数据集，使用片段定位的 R@1分数 作为停止分数
+                stop_score = metrics["R@1,IoU=0.5"] + metrics["R@1,IoU=0.7"]
 
             # 如果当前分数优于之前的最佳分数，则保存模型
             if stop_score > prev_best_score:
@@ -280,6 +280,7 @@ def main(opt, resume=None, domain=None):
     copied_eval_config = copy.deepcopy(dataset_config)
     copied_eval_config.data_path = opt.eval_path
     copied_eval_config.q_feat_dir = opt.t_feat_dir_pretrain_eval if opt.t_feat_dir_pretrain_eval is not None else opt.t_feat_dir
+    copied_eval_config.test_mode = True
     eval_dataset = StartEndDataset(**copied_eval_config) 
     
     # prepare model
