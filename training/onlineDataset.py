@@ -87,6 +87,13 @@ class StartEndDataset(Dataset):
         
         # data
         self.data = self.load_data()
+
+        # 如果是activitynet或者tacos数据集，则均匀采样部分视频样本来降低内存消耗，并减少训练时间  
+        if self.dset_name == "activitynet":
+            self.data = self.data[:len(self.data)//4]
+        elif self.dset_name == "tacos" and self.test_mode:
+            self.data = self.data[:len(self.data)//4]
+
         self.load_saliency_scores() 
 
         # 分块信息
@@ -131,305 +138,6 @@ class StartEndDataset(Dataset):
                     all_vid_scores[start_frame:end_frame] = 1
                 self.saliency_scores_list[(line["vid"],line["qid"])]= all_vid_scores
 
-    # def chunk_all_videos(self):
-    #     """分块所有视频并生成软标签
-    #     Returns:
-    #         chunk_infos: list[dict], 每个dict包含一个chunk的完整信息
-    #         total_length: int, 总chunk数量
-    #     """
-    #     chunk_infos = []
-    #     total_length = 0
-        
-    #     for line in self.data:
-    #         # 基本信息准备
-    #         video_feat = self._get_video_feat_by_vid(line["vid"])
-    #         # duration_frame = math.ceil(line["duration"] * self.fps)
-    #         duration_frame = len(self._get_video_feat_by_vid(line["vid"]))
-
-    #         # 计算目标片段位置
-    #         gt_windows = line["relevant_windows"]
-    #         for idx, windows in enumerate(gt_windows):
-    #                 gt_windows[idx] = [math.floor(windows[0] * self.fps), math.floor(windows[1] * self.fps)]
-                
-    #         # 确定chunk的起始位置
-    #         if not self.test_mode:
-    #             interval = self.chunk_interval - 1 + self.short_memory_sample_length
-    #             offset = np.random.randint(interval)
-    #         else:
-    #             offset = 0
-    #             interval = self.chunk_interval
-
-    #         range_end = duration_frame + 1 - self.short_memory_sample_length
-    #         for idx, short_memory_start in enumerate(range(offset, range_end, interval)):
-    #             if (short_memory_start + self.short_memory_sample_length) <= duration_frame:
-    #                 # 构建chunk基本信息
-    #                 chunk_info = {
-    #                     "chunk_idx": total_length,
-    #                     "qid": line["qid"],
-    #                     "query": line["query"],
-    #                     "vid": line["vid"],
-    #                     "duration_frame": duration_frame,
-    #                     "gt_windows": gt_windows,
-    #                     "short_memory_start": short_memory_start
-    #                 }
-
-    #                 # if not self.test_mode:
-    #                 if True:
-    #                     # 生成软标签
-    #                     chunk_labels = self.get_chunk_labels(chunk_info)
-    #                     if chunk_labels is None:
-    #                         continue  # 跳过无效的chunk
-                        
-    #                     # 更新chunk信息
-    #                     chunk_info.update({
-    #                         'start_label': chunk_labels['start_label'],
-    #                         'middle_label': chunk_labels['middle_label'],
-    #                         'end_label': chunk_labels['end_label']
-    #                     })
-
-    #                     # 生成saliency标签
-    #                     boundary = [short_memory_start, 
-    #                               short_memory_start + self.short_memory_sample_length]
-                                
-    #                     if 'qvhighlight' in self.dset_name and "sub_train" not in self.dset_name:
-    #                         scores_key = (chunk_info["vid"], chunk_info["qid"])
-    #                         if scores_key not in self.saliency_scores_list:
-    #                             continue
-                            
-    #                         saliency_labels = self.get_saliency_labels_all(
-    #                             chunk_info["gt_windows"],  # 直接传入所有 GT 窗口
-    #                             self.saliency_scores_list[scores_key],
-    #                             boundary
-    #                         )
-                                
-    #                     elif self.dset_name in ['charades', 'tacos', 'activitynet', 
-    #                                             'clotho-moment', 'unav100-subset', 'tut2017']:
-    #                         saliency_labels = self.get_saliency_labels_sub_as_query(
-    #                             boundary,
-    #                             chunk_info["gt_windows"],  # 直接传入所有 GT 窗口
-    #                             self.short_memory_sample_length
-    #                         )
-    #                     else:
-    #                         raise NotImplementedError                       
-                        
-    #                     if saliency_labels is None:
-    #                         continue
-
-    #                     chunk_info.update({
-    #                         "saliency_pos_labels": saliency_labels[0],
-    #                         "saliency_neg_labels": saliency_labels[1],
-    #                         "saliency_all_labels": saliency_labels[2]
-    #                         })
-
-    #                 chunk_infos.append(chunk_info)
-    #                 total_length += 1
-
-    #     # 验证chunk_infos的完整性
-    #     valid_chunk_infos = []
-    #     for i, chunk_info in enumerate(chunk_infos):
-    #         if not isinstance(chunk_info, dict):
-    #             print(f"Warning: chunk_infos[{i}] is not a dictionary. Skipping.")
-    #             continue
-            
-    #         # if not self.test_mode:
-    #         #     required_keys = {
-    #         #         'start_label', 'middle_label', 'end_label',
-    #         #         'saliency_pos_labels', 'saliency_neg_labels'
-    #         #     }
-    #         #     if not all(k in chunk_info for k in required_keys):
-    #         #         print(f"Warning: chunk_infos[{i}] missing required keys. Skipping.")
-    #         #         continue
-
-    #         valid_chunk_infos.append(chunk_info)
-
-    #     print(f"Generated {len(valid_chunk_infos)} valid chunks out of {total_length} total chunks")
-
-    #     return valid_chunk_infos, len(valid_chunk_infos)
-
-    # def chunk_all_videos(self):
-    #     """分块所有视频并生成软标签
-    #     Returns:
-    #         chunk_infos: list[dict], 每个dict包含一个chunk的完整信息
-    #         total_length: int, 总chunk数量
-    #     """
-    #     chunk_infos = []
-    #     total_length = 0
-
-    #     line_cnt = 0
-        
-    #     for line in self.data:
-            
-    #         line_cnt += 1
-
-    #         # 基本信息准备
-    #         video_feat = self._get_video_feat_by_vid(line["vid"])
-    #         duration_frame = len(video_feat)
-
-    #         # 计算目标片段位置
-    #         gt_windows = line["relevant_windows"]
-    #         for idx, windows in enumerate(gt_windows):
-    #             gt_windows[idx] = [math.floor(windows[0] * self.fps), math.floor(windows[1] * self.fps)]
-            
-    #         # 确定chunk的起始位置
-    #         if not self.test_mode:
-    #             interval = self.chunk_interval - 1 + self.short_memory_sample_length
-    #             offset = np.random.randint(interval)
-    #             while(duration_frame - offset <= 0):
-    #                 offset = np.random.randint(interval)
-    #         else:
-    #             offset = 0
-    #             interval = self.chunk_interval
-
-    #         # 计算正负样本采样比例
-    #         if not self.test_mode and self.neg_pos_ratio:
-    #             # 计算正样本的帧范围
-    #             pos_chunk_cnt = sum([e - s for s, e in gt_windows])  # 所有GT片段的总帧数
-    #             alpha_pos, alpha_neg = 1 + self.pos_expansion_ratio, 1 - self.pos_expansion_ratio
-
-    #             # 扩展正样本范围
-    #             expanded_framestamps = []
-    #             for s, e in gt_windows:
-    #                 expanded_framestamps.append([
-    #                     max(0, int((alpha_pos * s + alpha_neg * e) / 2)),
-    #                     min(duration_frame, int((alpha_neg * s + alpha_pos * e) / 2))
-    #                 ])
-
-    #             # 计算负样本的帧数
-    #             out_neg_chunk_cnt = (self.neg_pos_ratio - self.pos_expansion_ratio + 1) * pos_chunk_cnt
-
-    #             # 计算理论负样本数量
-    #             max_possible_neg_cnt = duration_frame - offset - sum(e - s for s, e in expanded_framestamps)
-
-    #             # 确保计算出的负样本数量不会超过实际可能的数量
-    #             out_neg_chunk_cnt = min(out_neg_chunk_cnt, max_possible_neg_cnt)
-                
-    #             try:
-    #                 if(duration_frame - offset - self.pos_expansion_ratio * pos_chunk_cnt <= 0):
-    #                     out_sample_ratio = 0
-    #                 else:
-    #                     out_sample_ratio = min(
-    #                         1.0,
-    #                         out_neg_chunk_cnt / (duration_frame - offset - self.pos_expansion_ratio * pos_chunk_cnt)
-    #                     )
-    #             except Exception as e:
-    #                 print("some info: ")
-    #                 print("out_neg_chunk_cnt: ", out_neg_chunk_cnt)
-    #                 print("pos_chunk_cnt: ", pos_chunk_cnt)
-    #                 print("duration_frame: ", duration_frame)
-    #                 print("pos_expansion_ratio: ", self.pos_expansion_ratio)
-    #                 print("offset: ", offset)
-
-    #                 print("line: ",line)
-    #                 print("exception: ",e)
-    #                 input("^^^^^^^^^^^^^^^^^^^^^")
-
-
-    #             # 生成采样标志
-    #             sample_score = np.random.uniform(.0, 1.0, duration_frame - offset)
-    #             sample_flag = (sample_score <= out_sample_ratio)
-
-    #             # 强制将扩展后的正样本范围内的帧标记为 True
-    #             for expanded_range in expanded_framestamps:
-    #                 sample_flag[expanded_range[0]:expanded_range[1]] = True
-
-    #             # 根据间隔下采样
-    #             sample_flag = sample_flag[::interval]
-    #         else:
-    #             # 如果没有设置负样本比例，则默认所有帧都会被选中
-    #             sample_flag = np.ones(max(1, duration_frame - offset) // interval + 1, dtype=bool)
-
-    #         # print("sample_flag", sample_flag)
-    #         # input("wait w w, check what is sample_flag")
-
-
-    #         # 开始采样
-    #         range_end = duration_frame + 1 - self.short_memory_sample_length
-    #         for idx, short_memory_start in enumerate(range(offset, range_end, interval)):
-    #             if (short_memory_start + self.short_memory_sample_length) <= duration_frame:
-    #                 # 检查当前chunk是否被选中
-    #                 if not sample_flag[idx]:
-    #                     continue  # 跳过未被选中的chunk
-
-    #                 # 构建chunk基本信息
-    #                 chunk_info = {
-    #                     "chunk_idx": total_length,
-    #                     "qid": line["qid"],
-    #                     "query": line["query"],
-    #                     "vid": line["vid"],
-    #                     "duration_frame": duration_frame,
-    #                     "gt_windows": gt_windows,
-    #                     "short_memory_start": short_memory_start
-    #                 }
-
-    #                 # if not self.test_mode:
-    #                 if True:
-    #                     # 生成软标签
-    #                     chunk_labels = self.get_chunk_labels(chunk_info)
-    #                     if chunk_labels is None:
-    #                         continue  # 跳过无效的chunk
-                        
-    #                     # 更新chunk信息
-    #                     chunk_info.update({
-    #                         'start_label': chunk_labels['start_label'],
-    #                         'middle_label': chunk_labels['middle_label'],
-    #                         'end_label': chunk_labels['end_label']
-    #                     })
-
-    #                     # 生成saliency标签
-    #                     boundary = [short_memory_start, short_memory_start + self.short_memory_sample_length]
-    #                     if 'qvhighlight' in self.dset_name and "sub_train" not in self.dset_name:
-    #                         scores_key = (chunk_info["vid"], chunk_info["qid"])
-    #                         if scores_key not in self.saliency_scores_list:
-    #                             continue
-                            
-    #                         saliency_labels = self.get_saliency_labels_all(
-    #                             chunk_info["gt_windows"],  # 直接传入所有 GT 窗口
-    #                             self.saliency_scores_list[scores_key],
-    #                             boundary
-    #                         )
-    #                     elif self.dset_name in ['charades', 'tacos', 'activitynet', 
-    #                                             'clotho-moment', 'unav100-subset', 'tut2017']:
-    #                         saliency_labels = self.get_saliency_labels_sub_as_query(
-    #                             boundary,
-    #                             chunk_info["gt_windows"],  # 直接传入所有 GT 窗口
-    #                             self.short_memory_sample_length
-    #                         )
-    #                     else:
-    #                         raise NotImplementedError
-                        
-    #                     if saliency_labels is None:
-    #                         continue
-
-    #                     chunk_info.update({
-    #                         "saliency_pos_labels": saliency_labels[0],
-    #                         "saliency_neg_labels": saliency_labels[1],
-    #                         "saliency_all_labels": saliency_labels[2]
-    #                     })
-
-    #                 chunk_infos.append(chunk_info)
-    #                 total_length += 1
-
-    #     # 验证chunk_infos的完整性
-    #     valid_chunk_infos = []
-    #     for i, chunk_info in enumerate(chunk_infos):
-    #         if not isinstance(chunk_info, dict):
-    #             print(f"Warning: chunk_infos[{i}] is not a dictionary. Skipping.")
-    #             continue
-            
-    #         required_keys = {
-    #             'start_label', 'middle_label', 'end_label',
-    #             'saliency_pos_labels', 'saliency_neg_labels'
-    #         }
-    #         if not all(k in chunk_info for k in required_keys):
-    #             print(f"Warning: chunk_infos[{i}] missing required keys. Skipping.")
-    #             continue
-
-    #         valid_chunk_infos.append(chunk_info)
-
-    #     print(f"Generated {len(valid_chunk_infos)} valid chunks out of {total_length} total chunks, line_cnt: {line_cnt}")
-
-    #     return valid_chunk_infos, len(valid_chunk_infos)
-
     def chunk_all_videos(self):
         """分块所有视频并生成软标签
         Returns:
@@ -457,6 +165,7 @@ class StartEndDataset(Dataset):
             # 确定chunk的起始位置
             if not self.test_mode:
                 interval = self.chunk_interval - 1 + self.short_memory_sample_length
+                # interval = self.chunk_interval - 1 + self.short_memory_sample_length + 4
                 offset = np.random.randint(interval)
                 while(duration_frame - offset <= 0):
                     offset = np.random.randint(interval)
@@ -687,12 +396,6 @@ class StartEndDataset(Dataset):
             )
             if soft_labels is None:
                 continue
-            
-            # for item in (soft_labels["start"], soft_labels["middle"], soft_labels["end"]):
-            #     for score in item:
-            #         if np.isnan(score):
-            #             print("cur chunk:", chunk_info)
-            #             input("wait! nan occur!")   
                                         
             # 截取当前chunk的部分
             start_labels.append(soft_labels['start'][chunk_start:chunk_end])
@@ -864,52 +567,50 @@ class StartEndDataset(Dataset):
 
 
     def get_saliency_labels_sub_as_query(self, boundary, gt_windows, ctx_l, max_n=1):
-        """处理多个GT片段的显著性标签生成
+        """处理多个GT片段的显著性标签生成 (左闭右开)
         Args:
-            boundary (list): [st, ed] 当前chunk的边界
-            gt_windows (list): 多个GT片段的列表，每个元素为 [st, ed]
+            boundary (list): [st, ed] 当前chunk的边界 (左闭右开)
+            gt_windows (list): 多个GT片段的列表，每个元素为 [st, ed] (左闭右开)
             ctx_l (int): chunk的长度
             max_n (int): 每类（正/负样本）最多选择的样本数
         """
         all_pos_pools = []
         all_neg_pools = []
         st, ed = boundary
-        
+
         # 对每个GT窗口计算正负样本池
-        for gt_window in gt_windows:
-            gt_st, gt_ed = gt_window
-            
-            # 计算交集
+        for gt_st, gt_ed in gt_windows:
+            # 计算交集（左闭右开）
             intersect_st = max(st, gt_st)
             intersect_ed = min(ed, gt_ed)
-            
-            # 收集正样本池
-            if intersect_st <= intersect_ed:
-                all_pos_pools.extend(list(range(int(intersect_st), int(intersect_ed) + 1)))
-                
-            # 收集负样本池
+
+            # 收集正样本池（左闭右开区间）
+            if intersect_st < intersect_ed:  # 只有在有交集的情况下才添加
+                all_pos_pools.extend(range(int(intersect_st), int(intersect_ed)))
+
+            # 计算负样本池（排除正样本的区域）
             curr_neg_pool = list(range(int(st), int(intersect_st))) + \
-                        list(range(int(intersect_ed) + 1, int(ed) + 1))
+                            list(range(int(intersect_ed), int(ed)))  # `intersect_ed` 直接用，不 +1
             all_neg_pools.extend(curr_neg_pool)
-        
-        # 去重
+
+        # 去重并保证负样本不包含正样本
         all_pos_pools = list(set(all_pos_pools))
-        all_neg_pools = list(set(all_neg_pools) - set(all_pos_pools))  # 确保负样本不在正样本中
-        
+        all_neg_pools = list(set(all_neg_pools) - set(all_pos_pools))
+
         # 选择样本
         pos_clip_indices = random.sample(all_pos_pools, k=min(max_n, len(all_pos_pools))) if all_pos_pools else []
         neg_clip_indices = random.sample(all_neg_pools, k=min(max_n, len(all_neg_pools))) if all_neg_pools else []
-        
+
         # 填充到固定长度
         pos_clip_indices.extend([-1] * (max_n - len(pos_clip_indices)))
         neg_clip_indices.extend([-1] * (max_n - len(neg_clip_indices)))
-        
-        # 生成分数数组
+
+        # 生成分数数组（左闭右开，索引不能超过 ctx_l - 1）
         score_array = np.zeros(ctx_l)
         for pos_range in all_pos_pools:
-            if pos_range - st < ctx_l:  # 确保索引在范围内
+            if 0 <= pos_range - st < ctx_l:  # 允许索引范围 [0, ctx_l-1]
                 score_array[pos_range - st] = 1
-                
+
         return pos_clip_indices, neg_clip_indices, score_array
 
     def get_saliency_labels_all(self, gt_windows, gt_scores, boundary, max_n=1):
@@ -919,7 +620,7 @@ class StartEndDataset(Dataset):
         all_neg_indices = []
         
         # 生成分数数组
-        score_array = np.zeros(ed - st + 1)
+        score_array = np.zeros(ed - st)
         
         try:
             for gt_window in gt_windows:
@@ -929,15 +630,14 @@ class StartEndDataset(Dataset):
                 intersect_st = int(max(gt_st, st))
                 intersect_ed = int(min(gt_ed, ed))
                 
-                if intersect_st <= intersect_ed:
+                if intersect_st < intersect_ed:
                     # 确保索引范围有效
                     src_start = max(0, intersect_st - gt_st)
-                    src_end = min(len(gt_scores), intersect_ed - gt_st + 1)
+                    src_end = min(len(gt_scores), intersect_ed - gt_st)
                     dst_start = max(0, intersect_st - st)
-                    dst_end = min(len(score_array), intersect_ed - st + 1)
+                    dst_end = min(len(score_array), intersect_ed - st)
                     
-                    # 确保源和目标长度相同
-                    length = min(src_end - src_start, dst_end - dst_start)
+                    length = src_end - src_start
                     if length > 0:
                         score_array[dst_start:dst_start + length] = \
                             gt_scores[src_start:src_start + length]
@@ -949,7 +649,7 @@ class StartEndDataset(Dataset):
                         all_pos_scores.extend(curr_scores)
                     
                     # 收集负样本
-                    curr_neg = list(range(st, gt_st)) + list(range(gt_ed + 1, ed + 1))
+                    curr_neg = list(range(st, gt_st)) + list(range(gt_ed, ed))
                     all_neg_indices.extend(curr_neg) 
         except Exception as e:
             print(f"Error in get_saliency_labels_all: {str(e)}")
@@ -957,7 +657,8 @@ class StartEndDataset(Dataset):
             print(f"GT window: {gt_st}, {gt_ed}")
             print(f"Intersection: {intersect_st}, {intersect_ed}")
             print(f"Array shapes - score_array: {len(score_array)}, gt_scores: {len(gt_scores)}")
-            return [], [], np.zeros(ed - st + 1)
+            input("press enter to continue, or ctrl-c to exit")
+            return [], [], np.zeros(ed - st)
         
         # 去重并选择分数最高的正样本
         if all_pos_indices:

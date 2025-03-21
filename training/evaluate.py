@@ -421,7 +421,7 @@ def start_inference(opt, domain=None):
     logger.info("Starting inference...")
     with torch.no_grad():
         metrics, eval_loss_meters, latest_file_paths = \
-            eval_epoch(epoch_i, model, eval_dataset, opt, save_submission_filename, criterion)
+            eval_epoch(epoch_i, model, eval_dataset, opt, save_submission_filename)
 
     # print("metrics is {}".format(metrics))
 

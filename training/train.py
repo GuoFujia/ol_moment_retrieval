@@ -144,18 +144,17 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i):
         else:
             outputs = model(**model_inputs)  
             total_loss, loss_dict = criterion(outputs, targets)
-            losses = sum(loss_dict[k] * criterion.weight_dict[k] for k in loss_dict.keys() if k in criterion.weight_dict)
+            # losses = sum(loss_dict[k] * criterion.weight_dict[k] for k in loss_dict.keys() if k in criterion.weight_dict)
+
+            # 不用weight_dict，将loss简单相加
+            losses = total_loss
                
             # print("total_loss",total_loss)
             # print("loss_dict",loss_dict)
             # print("weight_dict",criterion.weight_dict)
             # print("losses",losses)
+            # print(f"losses grad_fn: {losses.grad_fn}")
             # input("linggangu")
-
-            # if opt.model_name == 'tr_detr' \
-            #     and (opt.dset_name != 'tvsum' and opt.dset_name != 'youtube_highlight' 
-            #         and opt.dset_name != 'qvhighlight_pretrain'):
-            #     losses += additional_trdetr_losses(model_inputs, outputs, targets, opt)
             
             optimizer.zero_grad()
             losses.backward()
@@ -174,7 +173,8 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i):
 
         loss_dict["loss_overall"] = float(losses)
         for k, v in loss_dict.items():
-            loss_meters[k].update(float(v) * criterion.weight_dict[k] if k in criterion.weight_dict else float(v))
+            # loss_meters[k].update(float(v) * criterion.weight_dict[k] if k in criterion.weight_dict else float(v))
+            loss_meters[k].update(float(v))
 
     # 打印统计结果
     logger.info(f"[Epoch {epoch_i+1}] Irrelevant predictions: {irrelevant_count}, Other predictions: {other_count}\t")
@@ -211,22 +211,17 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
             with torch.no_grad():
                 if opt.model_ema:
                     metrics, eval_loss_meters, latest_file_paths = \
-                        eval_epoch(epoch_i, model_ema.module, val_dataset, opt, save_submission_filename, criterion)
+                        eval_epoch(epoch_i, model_ema.module, val_dataset, opt, save_submission_filename)
                 else:
                     metrics, eval_loss_meters, latest_file_paths = \
-                        eval_epoch(epoch_i, model, val_dataset, opt, save_submission_filename, criterion)
+                        eval_epoch(epoch_i, model, val_dataset, opt, save_submission_filename)
+                        # eval_epoch(epoch_i, model, val_dataset, opt, save_submission_filename, criterion)
+
 
             # 修改日志记录部分，适应新的 metrics 结构
             write_log(opt, epoch_i, eval_loss_meters, metrics=metrics, mode='val')            
             logger.info("metrics {}".format(pprint.pformat(metrics, indent=4)))
             
-            # if opt.dset_name == 'tvsum' or opt.dset_name == 'youtube_highlight':
-            #     # 如果数据集是 tvsum 或 youtube_highlight，使用 saliency_regression 的 mse 作为停止分数
-            #     stop_score = -metrics["saliency_regression"]["mse"]  # 越小越好，取负值
-            # else:
-            #     # 对于其他数据集，使用 frame_classification 的 f1_score 作为停止分数
-            #     stop_score = metrics["frame_classification"]["f1_score"]
-
             # 根据新的 metrics 结构选择停止分数
             if opt.dset_name == 'tvsum' or opt.dset_name == 'youtube_highlight':
             # 如果数据集是 tvsum 或 youtube_highlight，使用 saliency_mse 作为停止分数

@@ -625,6 +625,8 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
 
     # 遍历每个匹配的 query-video 组
     for key, group in matched_data_grouped.items():
+        if len(group) < 2:
+            continue
         # 获取该组的第一个gt来获取视频总长度
         _, first_gt = group[0]
         clip_length = first_gt["duration_frame"]
@@ -636,8 +638,6 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
         for sub, _ in group:
             all_st_probs.extend(np.array(sub["pred_frame_prob"])[:, 0])
             all_ed_probs.extend(np.array(sub["pred_frame_prob"])[:, 2])
-            # all_st_probs.extend(np.array(sub["pred_frame_prob"])[0])
-            # all_ed_probs.extend(np.array(sub["pred_frame_prob"])[2])
             all_pred_starts.extend([sub["pred_start"]] * len(sub["pred_frame_prob"]))
             all_pred_starts = [x + 8 for x in all_pred_starts]
 
@@ -658,13 +658,6 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
                 gt_spans_set.add((gt_start, gt_end))
         gt_spans = list(gt_spans_set)
 
-        # #   打印当前的candidate_moments和gt_spans
-        # print("当前的candidate_moments和gt_spans:")
-        # print("candidate_moments:", candidate_moments)
-        # print("gt_spans:", gt_spans)
-        # print("key:", key)
-        # input("请按回车键继续...")
-
         # 计算该组的 R@n, IoU=m
         for n in n_list:
             for m in iou_thresholds:
@@ -681,49 +674,128 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
     for k in r_at_n_metrics:
         r_at_n_metrics[k] = round(r_at_n_metrics[k] / total_queries * 100, 2) if total_queries > 0 else 0.0
 
-    # ================== 3. 显著性回归评估 ==================
-    if "pred_saliency_scores" in submission[0]:
-        saliency_metrics = {"mse": 0.0, "mae": 0.0}
-        if len(matched_data) > 0:
-            from sklearn.metrics import mean_squared_error, mean_absolute_error
+    # # ================== 3. 显著性回归评估 ==================
+    # if "pred_saliency_scores" in submission[0]:
+    #     saliency_metrics = {"mse": 0.0, "mae": 0.0}
+    #     if len(matched_data) > 0:
+    #         from sklearn.metrics import mean_squared_error, mean_absolute_error
             
-            pred_scores, gt_scores = [], []
-            for sub, gt in matched_data:
+    #         pred_scores, gt_scores = [], []
+    #         for sub, gt in matched_data:
+    #             vid = gt["vid"]
+    #             st = gt["short_memory_start"]
+                
+    #             # 获取预测分数
+    #             pred_scores_chunk = sub["pred_saliency_scores"]
+                
+    #             # 获取ground truth分数
+    #             ed = st + len(pred_scores_chunk)  # 使用预测分数的长度来确定结束位置
+    #             gt_scores_chunk = saliency_scores_all[vid,gt["qid"]][st:ed]
+                
+    #             # 确保长度匹配
+    #             min_len = min(len(pred_scores_chunk), len(gt_scores_chunk))
+    #             pred_scores.extend(pred_scores_chunk[:min_len])
+    #             gt_scores.extend(gt_scores_chunk[:min_len])
+
+    #             # print("saliency: gt:",gt_scores," sub:",pred_scores)
+    #             # input("please wait")
+                
+    #         # 再次验证长度
+    #         assert len(pred_scores) == len(gt_scores), \
+    #             f"Inconsistent lengths: pred_scores={len(pred_scores)}, gt_scores={len(gt_scores)}"
+            
+    #         # 计算指标
+    #         if len(pred_scores) > 0:
+    #             saliency_metrics["mse"] = mean_squared_error(gt_scores, pred_scores)
+    #             saliency_metrics["mae"] = mean_absolute_error(gt_scores, pred_scores)
+    
+    # ================== 3. 显著性回归评估with mAP and Hit1 ==================
+    if "pred_saliency_scores" in submission[0]:
+        # Convert predictions and ground truth to the format expected by evaluation
+        qid2preds = {}
+        qid2gt_scores_full_range = {}
+        
+        for key, group in matched_data_grouped.items():
+            qid = key[0]
+            # Collect all predictions for this query
+            all_pred_scores = []
+            all_gt_scores = []
+            for sub, gt in group:
+                all_pred_scores.extend(sub["pred_saliency_scores"])
                 vid = gt["vid"]
                 st = gt["short_memory_start"]
-                
-                # 获取预测分数
-                pred_scores_chunk = sub["pred_saliency_scores"]
-                
-                # 获取ground truth分数
-                ed = st + len(pred_scores_chunk)  # 使用预测分数的长度来确定结束位置
-                gt_scores_chunk = saliency_scores_all[vid,gt["qid"]][st:ed]
-                
-                # 确保长度匹配
-                min_len = min(len(pred_scores_chunk), len(gt_scores_chunk))
-                pred_scores.extend(pred_scores_chunk[:min_len])
-                gt_scores.extend(gt_scores_chunk[:min_len])
-
-                # print("saliency: gt:",gt_scores," sub:",pred_scores)
-                # input("please wait")
+                ed = st + len(sub["pred_frame_prob"])
+                all_gt_scores.extend(saliency_scores_all[vid, gt["qid"]][st:ed])
             
-            # 再次验证长度
-            assert len(pred_scores) == len(gt_scores), \
-                f"Inconsistent lengths: pred_scores={len(pred_scores)}, gt_scores={len(gt_scores)}"
+            # Create prediction entry
+            qid2preds[qid] = {
+                "qid": qid,
+                "pred_saliency_scores": all_pred_scores
+            }
             
-            # 计算指标
-            if len(pred_scores) > 0:
-                saliency_metrics["mse"] = mean_squared_error(gt_scores, pred_scores)
-                saliency_metrics["mae"] = mean_absolute_error(gt_scores, pred_scores)
+            # Create ground truth entry - keep as single scores
+            qid2gt_scores_full_range[qid] = np.array(all_gt_scores)
+            
+        # Evaluate using the same thresholds as eval_highlight
+        # 如果gt的显著性分数中存在值大于1，说明是qv数据集
 
+        vid = ground_truth[0]["vid"]
+        if(vid.endswith(".0")):
+            gt_saliency_score_min_list = [2, 3, 4]  # Fair, Good, VeryGood thresholds
+            saliency_score_names = ["Fair", "Good", "VeryGood"]
+        elif((vid.startswith("s") and len(vid) > 3 and vid[3] == "-") or (vid.startswith("v_"))):
+            gt_saliency_score_min_list = [1]  # Good thresholds 
+            # 这个有点问题就是，因为标签值只有0，1，其实比较难说哪个帧是标签中最显著的，不像qv中
+            saliency_score_names = ["Good"]
+        highlight_det_metrics = {}
+        
+        for gt_saliency_score_min, score_name in zip(gt_saliency_score_min_list, saliency_score_names):
+            if verbose:
+                print(f"Calculating highlight scores with min score {gt_saliency_score_min} ({score_name})")
+            
+            # Convert scores to binary based on threshold
+            qid2gt_scores_binary = {
+                k: (v >= gt_saliency_score_min).astype(float)[:, np.newaxis]  # Add dimension to match expected shape
+                for k, v in qid2gt_scores_full_range.items()
+            }
+            
+            # Calculate metrics using single annotator scores
+            hit_at_one = float(f"{100 * np.mean([np.max(qid2gt_scores_binary[qid][np.argmax(qid2preds[qid]['pred_saliency_scores'])]) for qid in qid2preds]):.2f}")
+            
+            # Calculate AP for each query using single annotator scores
+            ap_scores = []
+            for qid in qid2preds:
+                y_true = qid2gt_scores_binary[qid][:, 0]  # Use the single score
+                y_predict = np.array(qid2preds[qid]["pred_saliency_scores"])
+                
+                # Handle length mismatches
+                if len(y_true) < len(y_predict):
+                    y_predict = y_predict[:len(y_true)]
+                elif len(y_true) > len(y_predict):
+                    _y_predict = np.zeros(len(y_true))
+                    _y_predict[:len(y_predict)] = y_predict
+                    y_predict = _y_predict
+                
+                ap_scores.append(get_ap(y_true, y_predict))
+            
+            mean_ap = float(f"{100 * np.mean(ap_scores):.2f}")
+            
+            highlight_det_metrics[f"HL-min-{score_name}"] = {
+                "HL-mAP": mean_ap,
+                "HL-Hit1": hit_at_one
+            }
+        
+        saliency_metrics = highlight_det_metrics
             
 
     # ================== 4. 最终指标整合 ==================
     final_metrics = OrderedDict()
     final_metrics.update(r_at_n_metrics)
     if "pred_saliency_scores" in submission[0]:
-        final_metrics["saliency_mse"] = saliency_metrics["mse"]
-        final_metrics["saliency_mae"] = saliency_metrics["mae"]
+        # final_metrics["saliency_mse"] = saliency_metrics["mse"]
+        # final_metrics["saliency_mae"] = saliency_metrics["mae"]
+        final_metrics["mAP"] = saliency_metrics["HL-min-Good"]["HL-mAP"]
+        final_metrics["Hit1"] = saliency_metrics["HL-min-Good"]["HL-Hit1"]
 
     return final_metrics
 

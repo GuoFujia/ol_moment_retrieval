@@ -41,9 +41,9 @@ class OLMomentDETR(nn.Module):
         self.max_v_l = max_v_l
         span_pred_dim = 2 if span_loss_type == "l1" else max_v_l * 2
         self.span_embed = MLP(hidden_dim, hidden_dim, span_pred_dim, 3)
-        # self.class_embed = nn.Linear(hidden_dim, 2)  # 0: background, 1: foreground
-
+        self.class_embed = nn.Linear(hidden_dim, 2)  # 0: background, 1: foreground
         self.frame_class_embed = MLP(hidden_dim, hidden_dim, 4, 3)  # 输出维度仍为4，但表示4个二分类的logits
+        self.saliency_proj = nn.Linear(hidden_dim, 1)
 
         self.use_txt_pos = use_txt_pos
         self.n_input_proj = n_input_proj
@@ -64,7 +64,6 @@ class OLMomentDETR(nn.Module):
             LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
         ][:n_input_proj])
 
-        self.saliency_proj = nn.Linear(hidden_dim, 1)
         self.aux_loss = aux_loss
 
     def forward(self, src_txt, src_txt_mask, src_vid, memory_len, src_vid_mask, chunk_idx, src_aud=None, src_aud_mask=None):
@@ -76,14 +75,17 @@ class OLMomentDETR(nn.Module):
                     L_vid = long_mempry_sample_length + short_mempry_sample_length + future_mempry_sample_length
                 -memory_len: [], 三种记忆的采样长度
         返回值为包含以下内容的dict:
+                -"pred_spans": The normalized boxes coordinates for all queries, represented as
+                               (center_x, width). These values are normalized in [0, 1],
+                               relative to the size of each individual image (disregarding possible padding).
+                               See PostProcess for information on how to retrieve the unnormalized bounding box.
+                -"pred_logits": The class prediction for all queries.
                 -"frame_pred": short记忆的逐帧预测概率
                 -"saliency_scores": short记忆的逐帧saliency score
+                -"chunk_idx": chunk index
 
         """
 
-        print(f"[DEBUG] OLMomentDETR forward - Batch size: {src_txt.shape[0]}, Memory lengths: {memory_len}")
-        # 修改后：使用long+short memory的queries
-        self.num_queries = memory_len[0] + memory_len[1]  # long + short
 
         #   拼接音频特征
         if src_aud is not None:
@@ -92,70 +94,46 @@ class OLMomentDETR(nn.Module):
         src_vid = self.input_vid_proj(src_vid)
         src_txt = self.input_txt_proj(src_txt)
         #   拼接视频和文本的特征，掩码
-
-        # print("src_vid:",src_vid.shape,"src_txt:",src_txt.shape)
-        # input("请按回车键继续...")
-        
         src = torch.cat([src_vid, src_txt], dim=1)  # (bsz, L_vid+L_txt, d)
         mask = torch.cat([src_vid_mask, src_txt_mask], dim=1).bool()  # (bsz, L_vid+L_txt)
         #   分别生成位置编码并拼接
-        # TODO should we remove or use different positional embeddings to the src_txt?
         pos_vid = self.position_embed(src_vid, src_vid_mask)  # (bsz, L_vid, d)
         pos_txt = self.txt_position_embed(src_txt) if self.use_txt_pos else torch.zeros_like(src_txt)  # (bsz, L_txt, d)
-        # pos_txt = torch.zeros_like(src_txt)
-        # pad zeros for txt positions
         pos = torch.cat([pos_vid, pos_txt], dim=1)
         # (#layers, bsz, #queries, d), (bsz, L_vid+L_txt, d)
         #   通过transformer
         hs, memory = self.transformer(src, ~mask, self.query_embed.weight, pos)
         # hs.shape = (num_decoder_layers, batch_size, num_queries, hidden_dim)
 
+        out = {}
 
-        #   使用掩码确定实际的long memory长度
-        long_memory_mask = src_vid_mask[:, :memory_len[0]]
-        actual_long_len = long_memory_mask.sum(dim=1).max().item()  # 获取batch中最长的有效长度
+        # follow moment-detr
+        outputs_class = self.class_embed(hs)  # (#layers, batch_size, #queries, #classes)
+        outputs_coord = self.span_embed(hs)  # (#layers, bsz, #queries, 2 or max_v_l * 2)
+        if self.span_loss_type == "l1":
+            outputs_coord = outputs_coord.sigmoid()
+        out['pred_logits'] = outputs_class[-1]
+        out['pred_spans'] = outputs_coord[-1]
         
-        # 使用实际长度进行切片
-        short_start = min(memory_len[0], actual_long_len)
-        short_end = short_start + memory_len[1]
-
-        out = {'frame_pred': self.frame_class_embed(hs)[-1][:, short_start:short_end]}
-        
-        print("hs shape:", hs.shape)
-        print(self.frame_class_embed(hs)[-1].shape)
-        input("in forward")
-        print(f"[DEBUG] Frame predictions shape: {out['frame_pred'].shape}")
-
-        # print("actual_long_len:",actual_long_len,"memory_len:",memory_len)
-        # print("short_memory_start:",short_start)
-        # print("short_memory_end:",short_end)
-        # print("out['frame_pred']:",out['frame_pred'])
-        # input("请按回车键继续...")
-
-        #   saliency score的计算可以沿用
-        # txt_mem = memory[:, src_vid.shape[1]:]  # (bsz, L_txt, d)
+        # 帧预测结果和显著性分数
         vid_mem = memory[:, :src_vid.shape[1]]  # (bsz, L_vid, d)
-
-        st=memory_len[0]
-        ed=st + memory_len[1]
-        vid_mem_short = vid_mem[:, st:ed, :]  # (bsz, ed - st, d)
-
-        out["saliency_scores"] = self.saliency_proj(vid_mem_short).squeeze(-1)  # (bsz, short_memory_length)
-
+        short_start = memory_len[0]
+        short_end = short_start + memory_len[1]
+        
+        out['frame_pred'] = self.frame_class_embed(vid_mem)[:, short_start:short_end]    # (bsz, short_memory_length, 4)
+        out["saliency_scores"] = self.saliency_proj(vid_mem).squeeze(-1)[:, short_start:short_end]  # (bsz, short_memory_length)
+        # 如果是测试阶段，只取最后一个帧的预测,并保持形状
         if not self.training:
-            out["frame_pred"] = out["frame_pred"][:, -1, :].unsqueeze(1)  # 只取最后一个帧的预测,变成 (bsz, 1, 4)
-            # out["saliency_scores"] = out["saliency_scores"][:,-1]   
-            # saliency不能只取最后一帧，否则更没法做对比loss之类的了
+            out["frame_pred"] = out["frame_pred"][:, -1, :].unsqueeze(1)            # (bsz, 1, 4)
+            out["saliency_scores"] = out["saliency_scores"][:,-1].unsqueeze(1)      # (bsz, 1)
+
+        if self.aux_loss:
+            # assert proj_queries and proj_txt_mem
+            out['aux_outputs'] = [
+                {'pred_logits': a, 'pred_spans': b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
 
         # 添加 chunk_idx 到输出
         out["chunk_idx"] = chunk_idx  # [batch_size]
-
-        # if self.aux_loss:
-        #     # assert proj_queries and proj_txt_mem
-        #     out['aux_outputs'] = [
-        #         {'pred_logits': a, 'pred_spans': b} for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
-
-        # print("out:",out)
 
         return out
 
@@ -167,150 +145,96 @@ class SetCriterionOl(nn.Module):
     还考虑添加一个时序一致性loss来约束saliency score, 让相邻帧的saliency score预测结果变化更加平滑
     """
 
-    def __init__(self, weight_dict, losses, saliency_margin=1, use_consistency_loss=True, gamma=2):
+    def __init__(self, weight_dict, losses, saliency_margin=1, gamma=2):
         """ Create the criterion.
         Parameters:
             weight_dict: dict containing as key the names of the losses and as values their relative weight.
             losses: list of all the losses to be applied. See get_loss for list of available losses.
             saliency_margin: float, margin for saliency loss.
-            use_consistency_loss: bool, whether to use consistency loss.
             gamma: float, weight factor for hard sample mining in label loss.
         """
         super().__init__()
         self.weight_dict = weight_dict
         self.losses = losses
         self.saliency_margin = saliency_margin
-        self.use_consistency_loss = use_consistency_loss
         self.gamma = gamma  # 添加 gamma 作为初始化参数
 
-    # def loss_labels(self, outputs, targets, indices, log=True):
-    #     """修改后的帧分类损失函数"""
-    #     frame_pred = outputs['frame_pred']  # (batch_size, num_frames, 4)
+    def loss_spans(self, outputs, targets):
+        frame_pred = outputs['frame_pred']  # (batch_size, short_memory_len, 4)
+        chunk_idx = outputs.get('chunk_idx', None)
         
-    #     losses = {}
-    #     total_loss = 0
-
-    #     # 使用middle_label替代semantic_label
-    #     label_types = ['start_label', 'middle_label', 'end_label']
-    #     for i, label_type in enumerate(label_types):
-    #         target = targets[label_type].float()
-    #         frame_probs = torch.sigmoid(frame_pred)
-    #         pred = frame_probs[:, :, i]
-
-    #         # 计算加权BCE损失
-    #         loss = F.binary_cross_entropy_with_logits(
-    #             pred, target, reduction='none'
-    #         )
-    #         # 动态权重,赋予较难的类别较高的权重
-    #         weight = (target * (1 - target)).pow(self.gamma)  # 使用 gamma 计算权重
-    #         # weight = 1
-    #         loss = (loss * weight).mean()
-    #         if(np.isnan(loss.item())):
-    #             print("target:", target)
-    #             print("pred:", pred)
-    #             print("loss:", loss)
-    #             input("wait")
-            
-    #         losses[f'loss_{label_type}'] = loss
-    #         total_loss += loss
+        if chunk_idx is None:
+            raise ValueError("chunk_idx is missing in outputs")
         
-    #     # 条件性添加时序平滑损失
-    #     if self.use_consistency_loss:
-    #         pred_probs = torch.sigmoid(pred)  # 使用sigmoid获取概率
-    #         temporal_smooth = torch.mean((pred_probs[:, 1:] - pred_probs[:, :-1]).pow(2))
-    #         losses['loss_label'] = total_loss / 3.0 + 0.1 * temporal_smooth
-
-    #     return losses
-
-    # def loss_saliency(self, outputs, targets, indices, log=True):
-    #     """显著性损失"""
-    #     print("targets:", targets)
-    #     print("outputs:", outputs)
-    #     input("in loss saliency: wait! ")
-
-    #     if ("saliency_scores" not in outputs or 
-    #         "saliency_pos_labels" not in targets or 
-    #         "short_memory_start" not in targets):
-    #         print("info lacked to compute loss saliency")
-    #         return {"loss_saliency": 0}
-
-    #     saliency_scores = outputs["saliency_scores"]
-    #     pos_indices = targets["saliency_pos_labels"]
-    #     neg_indices = targets["saliency_neg_labels"]
+        device = frame_pred.device
+        batch_size = frame_pred.shape[0]
+        seq_len = frame_pred.shape[1]
         
-    #     # 获取每个样本的short_memory_start
-    #     short_memory_starts = targets["short_memory_start"]["spans"]
+        # 初始化 loss_v1，不需要梯度
+        loss_v1 = torch.tensor(0.0, device=device, requires_grad=False)
+        valid_samples = 0
         
-    #     # 收集有效样本
-    #     valid_pos_scores = []
-    #     valid_neg_scores = []
-    #     for i in range(len(pos_indices)):
-    #         if i >= len(short_memory_starts):  # 安全检查
-    #             continue
+        for i, idx in enumerate(chunk_idx):
+            target_meta = next((meta for meta in targets['meta'] if meta['chunk_idx'] == idx.item()), None)
+            if target_meta is None:
+                continue
+                    
+            short_memory_start = target_meta['short_memory_start']
+            start_prob = torch.sigmoid(frame_pred[i, :, 0])  
+            end_prob = torch.sigmoid(frame_pred[i, :, 2])    
             
-    #         current_start = short_memory_starts[i]  # 获取当前样本的short_memory_start
-    #         pos_idx = pos_indices[i]
-    #         neg_idx = neg_indices[i]
+            span_scores = []  # 存储(start_idx, end_idx, confidence)
+            for st in range(seq_len):
+                for ed in range(st, seq_len):
+                    conf = start_prob[st] * end_prob[ed]
+                    global_st = st + short_memory_start
+                    global_ed = ed + short_memory_start
+                    span_scores.append((global_st, global_ed, conf))
             
-    #         # 跳过无效的索引
-    #         if pos_idx == -1 or neg_idx == -1:
-    #             continue
+            span_scores.sort(key=lambda x: x[2], reverse=True)
+            top_k = min(5, len(span_scores))
+            top_spans = span_scores[:top_k]
             
-    #         # 转换为相对于short memory的局部索引
-    #         pos_idx_local = pos_idx - current_start
-    #         neg_idx_local = neg_idx - current_start
+            gt_windows = target_meta['gt_windows']  # list of [start, end] pairs
             
-    #         if (0 <= pos_idx_local < saliency_scores.shape[1] and 
-    #             0 <= neg_idx_local < saliency_scores.shape[1]):
-    #             valid_pos_scores.append(saliency_scores[i, pos_idx_local])
-    #             valid_neg_scores.append(saliency_scores[i, neg_idx_local])
-
-    #     if not valid_pos_scores or not valid_neg_scores:
-    #         return {"loss_saliency": 0}
-
-    #     valid_pos_scores = torch.stack(valid_pos_scores)
-    #     valid_neg_scores = torch.stack(valid_neg_scores)
+            span_ious = []
+            pred_confs = []
+            for st, ed, conf in top_spans:
+                pred_span = torch.tensor([[st, ed]], device=device)
+                max_iou = float('-inf')
+                
+                for gt_start, gt_end in gt_windows:
+                    gt_span = torch.tensor([[gt_start, gt_end]], device=device)
+                    iou = generalized_temporal_iou(pred_span, gt_span)
+                    max_iou = max(max_iou, iou.item())
+                
+                span_ious.append(max_iou)
+                pred_confs.append(conf.item())
+            
+            if not span_ious:  # 如果没有有效的span
+                continue
+                    
+            span_ious = torch.tensor(span_ious, device=device, requires_grad=True)  # 需要梯度
+            pred_confs = torch.tensor(pred_confs, device=device, requires_grad=True)  # 需要梯度
+            
+            # 使用非原地操作
+            loss_v1 = loss_v1 + F.mse_loss(pred_confs, span_ious)
+            valid_samples += 1
         
-    #     # 1. 基础对比损失
-    #     base_loss = torch.clamp(
-    #         self.saliency_margin + valid_neg_scores - valid_pos_scores, 
-    #         min=0
-    #     ).mean()
+        if valid_samples > 0:
+            loss_v1 = loss_v1 / valid_samples
+        
+        return {
+            'loss_spans_v1': loss_v1
+        }
 
-    #     # 2. 添加L2正则化
-    #     l2_reg = 0.01 * (valid_pos_scores.pow(2).mean() + valid_neg_scores.pow(2).mean())
-
-    #     # 3. 条件性添加平滑损失
-    #     loss = base_loss + l2_reg
-    #     if self.use_consistency_loss:
-    #         smooth_loss = 0.1 * torch.mean(
-    #             (saliency_scores[:, 1:] - saliency_scores[:, :-1]).pow(2)
-    #         )
-    #         loss += smooth_loss
-
-    #     # print("sal loss ",loss)
-    #     # input("wait")
-
-    #     return {
-    #         "loss_saliency": loss
-    #     }
-
-    def loss_labels(self, outputs, targets, indices, log=True):
+    def loss_labels(self, outputs, targets, log=True):
         """帧分类损失函数，先筛选有效样本，再批量计算损失"""
-        frame_pred = outputs['frame_pred']  # (batch_size, num_frames, 4)
+        frame_pred = outputs['frame_pred']  # (batch_size, short_memory_len, 4)
         chunk_idx = outputs.get('chunk_idx', None)  # 获取 chunk_idx
 
         if chunk_idx is None:
             raise ValueError("chunk_idx is missing in outputs. Ensure it is passed correctly.")
-
-        # # 根据训练模式调整 frame_pred 的形状
-        # if not self.training:
-        #     # 非训练模式：frame_pred 的形状是 (batch_size, 4)
-        #     frame_pred = frame_pred.unsqueeze(1)  # 扩展为 (batch_size, 1, 4)
-
-        print("first 5 frame_pred:", frame_pred[:5])
-        print("first 5 targets:", targets['meta'][:5])
-        input("wait")
 
         # 筛选有效样本
         valid_preds = []
@@ -336,7 +260,7 @@ class SetCriterionOl(nn.Module):
                 end_label = end_label[-1:]  # 取最后一帧
 
             # 获取当前样本的预测
-            pred = frame_pred[i]  # (num_frames, 4)
+            pred = frame_pred[i]  # (short_memory_len, 4)
 
             # 添加到有效样本列表
             valid_preds.append(pred)
@@ -370,13 +294,6 @@ class SetCriterionOl(nn.Module):
                     valid_end_labels  # (num_valid_samples, num_frames)
             pred_slice = valid_preds[:, :, pred_idx]  # (num_valid_samples, num_frames)
 
-
-            # # 看下这些变量都在什么设备上
-            # print(f"{label_type} loss: {pred_slice.device}, {target.device}")
-            # print("pred_slice:",pred_slice)
-            # print("target:",target)
-            # input("Press Enter to continue...")
-
             # 计算加权BCE损失
             loss = F.binary_cross_entropy_with_logits(
                 pred_slice, target, reduction='none'
@@ -385,6 +302,7 @@ class SetCriterionOl(nn.Module):
             # 动态权重，赋予较难的类别较高的权重
             weight = (target * (1 - target)).pow(self.gamma)  # 使用 gamma 计算权重
             loss = (loss * weight).mean()
+            # loss = loss.mean()  # 先不用weight
 
             if torch.isnan(loss).any():
                 print(f"NaN detected in {label_type} loss. Target: {target}, Pred: {pred_slice}")
@@ -396,15 +314,9 @@ class SetCriterionOl(nn.Module):
         # 平均损失
         losses['loss_label'] = total_loss / 3  # 3 表示 start, middle, end
 
-        # 条件性添加时序平滑损失
-        if self.use_consistency_loss:
-            pred_probs = torch.sigmoid(valid_preds)  # 使用sigmoid获取概率
-            temporal_smooth = torch.mean((pred_probs[:, :, 1:] - pred_probs[:, :, :-1]).pow(2))
-            losses['loss_label'] += 0.1 * temporal_smooth
-
         return losses
 
-    def loss_saliency(self, outputs, targets, indices, log=True):
+    def loss_saliency(self, outputs, targets, log=True):
         """显著性损失函数，先筛选有效样本，再批量计算损失"""
         if ("saliency_scores" not in outputs or 
             "saliency_pos_labels" not in targets or 
@@ -418,15 +330,11 @@ class SetCriterionOl(nn.Module):
         if chunk_idx is None:
             raise ValueError("chunk_idx is missing in outputs. Ensure it is passed correctly.")
 
-        # # 根据训练模式调整 saliency_scores 的形状
-        # if not self.training:
-        #     # 非训练模式：saliency_scores 的形状是 (batch_size,)
-        #     saliency_scores = saliency_scores.unsqueeze(-1)  # 扩展为 (batch_size, 1)
-
         # 筛选有效样本
         valid_scores = []
         valid_pos_labels = []
         valid_neg_labels = []
+        valid_tgt_scores = []
 
         for i, idx in enumerate(chunk_idx):
             # 找到 targets 中对应的样本
@@ -441,22 +349,26 @@ class SetCriterionOl(nn.Module):
                 continue  # 如果其中一个为 -1，跳过该样本
 
             # 获取当前样本的预测和标签
-            pred_scores = saliency_scores[i]  # (num_frames,)
+            pred_scores = saliency_scores[i]  # (num_frames,)， 因为是模型的输出，所以已经是张量
             short_memory_start = target_meta['short_memory_start']
+            tgt_scores = torch.tensor(target_meta['saliency_all_labels'], dtype=torch.float32, device=pred_scores.device)   # 因为是从targets来的，所以需要手动转换为张量
 
             # 转换为相对于 short memory 的局部索引
             pos_indices = [pos_idx - short_memory_start for pos_idx in pos_labels]
             neg_indices = [neg_idx - short_memory_start for neg_idx in neg_labels]
 
-            # 确保索引在有效范围内
-            pos_indices = [idx for idx in pos_indices if 0 <= idx < pred_scores.shape[0]]
-            neg_indices = [idx for idx in neg_indices if 0 <= idx < pred_scores.shape[0]]
-
             if not pos_indices or not neg_indices:
                 continue  # 如果没有有效索引，跳过该样本
 
+            # 将索引列表转换为张量
+            pos_indices = torch.tensor([pos_idx - short_memory_start for pos_idx in pos_labels], 
+                                       dtype=torch.long, device=pred_scores.device)
+            neg_indices = torch.tensor([neg_idx - short_memory_start for neg_idx in neg_labels], 
+                                       dtype=torch.long, device=pred_scores.device)
+
             # 添加到有效样本列表
             valid_scores.append(pred_scores)
+            valid_tgt_scores.append(tgt_scores)
             valid_pos_labels.append(pos_indices)
             valid_neg_labels.append(neg_indices)
 
@@ -465,12 +377,16 @@ class SetCriterionOl(nn.Module):
 
         # 将有效样本组织成批量张量
         valid_scores = torch.stack(valid_scores)  # (num_valid_samples, num_frames)
+        valid_tgt_scores = torch.stack(valid_tgt_scores)  # (num_valid_samples, num_frames)
 
-        # 批量计算损失
+        # 1.批量计算对比损失
         base_losses = []
         for i in range(len(valid_scores)):
-            pos_scores = valid_scores[i, valid_pos_labels[i]]  # 正样本分数
-            neg_scores = valid_scores[i, valid_neg_labels[i]]  # 负样本分数
+            pos_indices = valid_pos_labels[i]  # 可能是多个索引的 tensor
+            neg_indices = valid_neg_labels[i]  # 可能是多个索引的 tensor
+
+            pos_scores = valid_scores[i, pos_indices]  
+            neg_scores = valid_scores[i, neg_indices]  
 
             # 基础对比损失
             base_loss = torch.clamp(
@@ -478,55 +394,48 @@ class SetCriterionOl(nn.Module):
                 min=0
             ).mean()
 
-            # 添加L2正则化
-            l2_reg = 0.01 * (pos_scores.pow(2).mean() + neg_scores.pow(2).mean())
-            base_loss += l2_reg
-
             base_losses.append(base_loss)
 
         # 平均所有样本的损失
-        final_loss = torch.mean(torch.stack(base_losses))
+        loss_contrastive = torch.mean(torch.stack(base_losses))
 
-        # 条件性添加平滑损失
-        if self.use_consistency_loss:
-            smooth_loss = 0.1 * torch.mean(
-                (valid_scores[:, 1:] - valid_scores[:, :-1]).pow(2)
-            )
-            final_loss += smooth_loss
+        # 2.计算celoss
+        # 创建二分类标签：valid_tgt_scores > 0 为正样本，否则为负样本
+        binary_targets = (valid_tgt_scores > 0).float()
 
+        # 使用 sigmoid 函数将分数转换为概率
+        pred_probs = torch.sigmoid(valid_scores)
+        
+        # 计算二元交叉熵损失
+        ce_loss_fn = torch.nn.BCELoss()
+        loss_ce = ce_loss_fn(pred_probs, binary_targets)
+
+        # 3.计算平滑L1损失
+        # 使用 smooth L1 损失 (Huber loss)
+        smooth_l1_loss_fn = torch.nn.SmoothL1Loss()
+        loss_smooth_l1 = smooth_l1_loss_fn(valid_scores, valid_tgt_scores)
+
+        # 合并所有损失
+        final_loss = loss_contrastive + loss_ce + loss_smooth_l1
         return {"loss_saliency": final_loss}
-
-    def loss_temporal_consistency(self, outputs, targets, indices):
-        """Temporal consistency loss for smooth predictions"""
-        if "saliency_scores" not in outputs:
-            return {"loss_temporal_consistency": 0}
-       
-        saliency_scores = outputs["saliency_scores"]  # (batch_size, #frames)
-        saliency_probs = torch.sigmoid(saliency_scores)  # (batch_size, #frames)
-
-        # Compute L2 loss between adjacent frames
-        loss_temporal = torch.mean((saliency_probs[:, 1:] - saliency_probs[:, :-1]) ** 2)
-        return {"loss_temporal_consistency": loss_temporal}
 
     def get_loss(self, loss, outputs, targets, indices, **kwargs):
         loss_map = {
             "labels": self.loss_labels,
             "saliency": self.loss_saliency,
-            "temporal_consistency": self.loss_temporal_consistency,
+            "span": self.loss_spans,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
-        return loss_map[loss](outputs, targets, indices, **kwargs)
+        return loss_map[loss](outputs, targets, **kwargs)
 
     def forward(self, outputs, targets):
         losses = {}
         for loss in self.losses:
             losses.update(self.get_loss(loss, outputs, targets, indices=None))
 
-        # Add temporal consistency loss if needed
-        if "temporal_consistency" in self.losses:
-            losses.update(self.loss_temporal_consistency(outputs, targets, indices=None))
+        # total_loss = sum(losses[k] * self.weight_dict.get(k, 1.0) for k in losses.keys())
+        total_loss = sum(losses.values())
 
-        total_loss = sum(losses[k] * self.weight_dict.get(k, 1.0) for k in losses.keys())
         return total_loss, losses
 
 
@@ -609,24 +518,17 @@ def build_model(args):
         "loss_middle_label": args.middle_label_loss_coef,  
         "loss_end_label": args.end_label_loss_coef,  
         "loss_saliency": args.saliency_loss_coef,   # 显著性分数损失的权重
+        # "loss_spans": args.span_loss_coef,  # span损失的权重
     }
-    # 如果使用一致性损失，为weight_dict添加"loss_temporal_consistency"
-    if args.use_consistency_loss:
-        weight_dict["loss_temporal_consistency"] = args.temporal_consistency_loss_coef
-
-    # 根据参数决定是否使用一致性损失
-    use_consistency = args.use_consistency_loss if hasattr(args, 'use_consistency_loss') else True
     
     # 条件性添加损失项
-    losses = ['labels', 'saliency']
-    if use_consistency:
-        losses.append('temporal_consistency')
+    # losses = ['labels', 'saliency', 'span']
+    losses = ['saliency', 'span']
     
     criterion = SetCriterionOl(
         weight_dict=weight_dict, 
         losses=losses,  # 传入条件性的损失列表
         saliency_margin=args.saliency_margin,
-        use_consistency_loss=use_consistency
     )
 
     criterion.to(device)

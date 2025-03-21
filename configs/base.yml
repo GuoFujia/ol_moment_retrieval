@@ -5,7 +5,7 @@ num_workers: 4
 short_memory_len : 8
 long_memory_sample_len: 16
 future_memory_sample_len: 0
-num_queries: 24 # 24 = 8 + 16 
+num_queries: 4 
 
 
 lr: 0.0001
@@ -46,9 +46,6 @@ start_label_loss_coef: 10
 middle_label_loss_coef: 10
 end_label_loss_coef: 10
 saliency_loss_coef: 5   
-loss_temporal_consistency: 5
-temporal_consistency_loss_coef: 5
-use_consistency_loss: False
 
 lw_saliency: 1
 eos_coef: 0.1
