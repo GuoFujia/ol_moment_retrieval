@@ -10,12 +10,119 @@ from lighthouse.common.misc import accuracy
 from lighthouse.common.moment_transformer import build_transformer
 
 
+class VideoMemoryCompressor(nn.Module):
+    """
+    基于注意力机制的视频记忆压缩模块
+    
+    输入:
+        Fv: 长期视频记忆特征，形状为 (batch_size, vid_len, dimension)
+        mask: 指示有效位置的掩码，形状为 (batch_size, vid_len)
+        
+    输出:
+        Fv_compress: 压缩后的视频特征，形状为 (batch_size, compress_len, dimension)
+    """
+    
+    def __init__(self, dimension, compress_len, num_heads=8, dropout=0.1):
+        """
+        初始化压缩模块
+        
+        参数:
+            dimension: 特征维度
+            compress_len: 压缩后的视频长度
+            num_heads: 多头注意力的头数
+            dropout: Dropout率
+        """
+        super(VideoMemoryCompressor, self).__init__()
+        
+        self.dimension = dimension
+        self.compress_len = compress_len
+        self.num_heads = num_heads
+        
+        # 确保dimension可以被num_heads整除
+        assert dimension % num_heads == 0, "维度必须能被头数整除"
+        
+        # 可学习的查询参数，将作为cross-attention中的query
+        # 形状: (1, compress_len, dimension)
+        self.query = nn.Parameter(torch.randn(1, compress_len, dimension))
+        
+        # 初始化查询参数
+        nn.init.xavier_uniform_(self.query)
+        
+        # 多头注意力层
+        self.multihead_attn = nn.MultiheadAttention(
+            embed_dim=dimension,
+            num_heads=num_heads,
+            dropout=dropout,
+            batch_first=True
+        )
+        
+        # 层归一化和残差连接
+        self.norm = nn.LayerNorm(dimension)
+        
+        # 前馈网络
+        self.feed_forward = nn.Sequential(
+            nn.Linear(dimension, 4 * dimension),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * dimension, dimension),
+            nn.Dropout(dropout)
+        )
+        
+        # 最终的层归一化
+        self.final_norm = nn.LayerNorm(dimension)
+        
+    def forward(self, Fv, mask=None):
+        """
+        前向传播
+        
+        参数:
+            Fv: 长期视频记忆特征，形状为 (batch_size, vid_len, dimension)
+            mask: 有效位置的掩码，形状为 (batch_size, vid_len)，True表示有效位置
+            
+        返回:
+            Fv_compress: 压缩后的视频特征，形状为 (batch_size, compress_len, dimension)
+        """
+        batch_size = Fv.size(0)
+        
+        # 扩展查询以匹配批次大小
+        # 从 (1, compress_len, dimension) 到 (batch_size, compress_len, dimension)
+        query = self.query.expand(batch_size, -1, -1)
+
+        key_padding_mask = None
+        if mask is not None:
+            # 创建key_padding_mask，其中False表示关注，True表示忽略
+            key_padding_mask = ~(mask.bool())
+        
+        # 应用多头注意力
+        # query: (batch_size, compress_len, dimension)
+        # key/value: (batch_size, vid_len, dimension)
+        attn_output, _ = self.multihead_attn(
+            query=query,
+            key=Fv,
+            value=Fv,
+            key_padding_mask=key_padding_mask
+        )
+        
+        # 残差连接和层归一化
+        attn_output = self.norm(query + attn_output)
+        
+        # 前馈网络
+        ff_output = self.feed_forward(attn_output)
+        
+        # 残差连接和最终层归一化
+        Fv_compress = self.final_norm(attn_output + ff_output)
+
+        # 创建压缩后的掩码，形状为 (batch_size, compress_len)，全为True
+        compress_mask = torch.ones((batch_size, self.compress_len), dtype=torch.bool, device=Fv.device)
+        
+        return Fv_compress, compress_mask
+
 class OLMomentDETR(nn.Module):
     """ This is the Moment-DETR module that performs moment localization. """
 
     def __init__(self, transformer, position_embed, txt_position_embed, txt_dim, vid_dim,
                  num_queries, input_dropout, aux_loss=False, max_v_l=75, span_loss_type="l1", 
-                 use_txt_pos=False, n_input_proj=2, aud_dim=0):
+                 use_txt_pos=False, n_input_proj=2, aud_dim=0, compress_len=10, use_vid_compression=True):
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture. See transformer.py
@@ -44,11 +151,16 @@ class OLMomentDETR(nn.Module):
         self.class_embed = nn.Linear(hidden_dim, 2)  # 0: background, 1: foreground
         self.frame_class_embed = MLP(hidden_dim, hidden_dim, 4, 3)  # 输出维度仍为4，但表示4个二分类的logits
         self.saliency_proj = nn.Linear(hidden_dim, 1)
+        self.compress_len = compress_len
 
         self.use_txt_pos = use_txt_pos
         self.n_input_proj = n_input_proj
         # self.foreground_thd = foreground_thd
         # self.background_thd = background_thd
+
+        self.use_vid_compression = use_vid_compression
+        if self.use_vid_compression:
+            self.memory_compressor = VideoMemoryCompressor(hidden_dim, compress_len=compress_len)
 
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         relu_args = [True] * 3
@@ -73,6 +185,7 @@ class OLMomentDETR(nn.Module):
                 -src_txt_mask: [batch_size, L_txt],
                 -src_vid: [batch_size, L_vid, D_vid], 
                     L_vid = long_mempry_sample_length + short_mempry_sample_length + future_mempry_sample_length
+                - src_vid_mask: [batch_size, L_vid]
                 -memory_len: [], 三种记忆的采样长度
         返回值为包含以下内容的dict:
                 -"pred_spans": The normalized boxes coordinates for all queries, represented as
@@ -86,24 +199,45 @@ class OLMomentDETR(nn.Module):
 
         """
 
-
         #   拼接音频特征
         if src_aud is not None:
             src_vid = torch.cat([src_vid, src_aud], dim=2)
         #   投影输入特征
         src_vid = self.input_vid_proj(src_vid)
         src_txt = self.input_txt_proj(src_txt)
+
+        # 取长期记忆视频，长期记忆mask
+        long_vid = src_vid[:, :memory_len[0]]
+        long_vid_mask = src_vid_mask[:, :memory_len[0]]
+        # 压缩长期记忆
+        if self.use_vid_compression:
+            compress_long_vid, compress_long_mask = self.memory_compressor(long_vid, long_vid_mask)
+            #   将压缩后的长期记忆和短期，future记忆拼接得到新的src_vid, src_vid_mask
+            src_vid, src_vid_mask = torch.cat([compress_long_vid, src_vid[:, memory_len[0]:]], dim=1), \
+                torch.cat([compress_long_mask, src_vid_mask[:, memory_len[0]:]], dim=1)
+            memory_len[0] = self.compress_len
+            # print("after compress, src_vid shape and src_vid_mask shape:", src_vid.shape, src_vid_mask.shape)
+
         #   拼接视频和文本的特征，掩码
         src = torch.cat([src_vid, src_txt], dim=1)  # (bsz, L_vid+L_txt, d)
         mask = torch.cat([src_vid_mask, src_txt_mask], dim=1).bool()  # (bsz, L_vid+L_txt)
         #   分别生成位置编码并拼接
         pos_vid = self.position_embed(src_vid, src_vid_mask)  # (bsz, L_vid, d)
+
+        # print("after compress, src_vid shape and src_vid_mask shape:", src_vid.shape, src_vid_mask.shape)
+        # print("shape of src, mask, pos_vid:", src.shape, mask.shape, pos_vid.shape)
+        # input("press enter to continue...")
+
+
         pos_txt = self.txt_position_embed(src_txt) if self.use_txt_pos else torch.zeros_like(src_txt)  # (bsz, L_txt, d)
         pos = torch.cat([pos_vid, pos_txt], dim=1)
         # (#layers, bsz, #queries, d), (bsz, L_vid+L_txt, d)
         #   通过transformer
-        hs, memory = self.transformer(src, ~mask, self.query_embed.weight, pos)
+        # hs, memory, compress_memory = self.transformer(src, ~mask, self.query_embed.weight, pos, use_memory_compression=False)
+        hs, memory= self.transformer(src, ~mask, self.query_embed.weight, pos)
         # hs.shape = (num_decoder_layers, batch_size, num_queries, hidden_dim)
+        # memory.shape = (batch_size, L_vid+L_txt, hidden_dim)
+        
 
         out = {}
 
@@ -122,10 +256,11 @@ class OLMomentDETR(nn.Module):
         
         out['frame_pred'] = self.frame_class_embed(vid_mem)[:, short_start:short_end]    # (bsz, short_memory_length, 4)
         out["saliency_scores"] = self.saliency_proj(vid_mem).squeeze(-1)[:, short_start:short_end]  # (bsz, short_memory_length)
-        # 如果是测试阶段，只取最后一个帧的预测,并保持形状
-        if not self.training:
-            out["frame_pred"] = out["frame_pred"][:, -1, :].unsqueeze(1)            # (bsz, 1, 4)
-            out["saliency_scores"] = out["saliency_scores"][:,-1].unsqueeze(1)      # (bsz, 1)
+
+        # # 如果是测试阶段，只取最后一个帧的预测,并保持形状
+        # if not self.training:
+        #     out["frame_pred"] = out["frame_pred"][:, -1, :].unsqueeze(1)            # (bsz, 1, 4)
+        #     out["saliency_scores"] = out["saliency_scores"][:,-1].unsqueeze(1)      # (bsz, 1)
 
         if self.aux_loss:
             # assert proj_queries and proj_txt_mem
@@ -145,7 +280,7 @@ class SetCriterionOl(nn.Module):
     还考虑添加一个时序一致性loss来约束saliency score, 让相邻帧的saliency score预测结果变化更加平滑
     """
 
-    def __init__(self, weight_dict, losses, saliency_margin=1, gamma=2):
+    def __init__(self, weight_dict, losses, saliency_margin=1, gamma=.0):
         """ Create the criterion.
         Parameters:
             weight_dict: dict containing as key the names of the losses and as values their relative weight.
@@ -170,8 +305,8 @@ class SetCriterionOl(nn.Module):
         batch_size = frame_pred.shape[0]
         seq_len = frame_pred.shape[1]
         
-        # 初始化 loss_v1，不需要梯度
-        loss_v1 = torch.tensor(0.0, device=device, requires_grad=False)
+        # 初始化 loss_v1
+        loss_v1 = torch.tensor(0.0, device=device, requires_grad=True)
         valid_samples = 0
         
         for i, idx in enumerate(chunk_idx):
@@ -241,7 +376,8 @@ class SetCriterionOl(nn.Module):
         valid_start_labels = []
         valid_middle_labels = []
         valid_end_labels = []
-
+        
+        # flag = 1
         for i, idx in enumerate(chunk_idx):
             # 找到 targets 中对应的样本
             target_meta = next((meta for meta in targets['meta'] if meta['chunk_idx'] == idx.item()), None)
@@ -253,11 +389,23 @@ class SetCriterionOl(nn.Module):
             middle_label = target_meta['middle_label']  # (num_frames,)
             end_label = target_meta['end_label']  # (num_frames,)
 
-            # 在非训练模式下，仅取最后一帧的标签
-            if not self.training:
-                start_label = start_label[-1:]  # 取最后一帧
-                middle_label = middle_label[-1:]  # 取最后一帧
-                end_label = end_label[-1:]  # 取最后一帧
+            # if flag == 1:
+            #     # 当前样本的meta信息，主要是视频时长，short_memory_start，relevant_windows
+            #     print("duration_frame: ", target_meta['duration_frame'])
+            #     print("short_memory_start: ", target_meta['short_memory_start'])
+            #     print("gt_windows: ", target_meta['gt_windows'])
+            #     # 当前样本的预测结果，按st，mid，ed分别显示
+            #     pred_start = frame_pred[i, :, 0]
+            #     pred_middle = frame_pred[i, :, 1]
+            #     pred_end = frame_pred[i, :, 2]
+            #     print("pred_start: ", torch.sigmoid(pred_start))
+            #     print("pred_middle: ", torch.sigmoid(pred_middle))
+            #     print("pred_end: ", torch.sigmoid(pred_end))
+            #     print("start_label: ", start_label)
+            #     print("middle_label: ", middle_label)
+            #     print("end_label: ", end_label)
+
+            #     flag = input("1 to continue, 0 to exit")
 
             # 获取当前样本的预测
             pred = frame_pred[i]  # (short_memory_len, 4)
@@ -294,13 +442,22 @@ class SetCriterionOl(nn.Module):
                     valid_end_labels  # (num_valid_samples, num_frames)
             pred_slice = valid_preds[:, :, pred_idx]  # (num_valid_samples, num_frames)
 
+            # 将 logits 转换为概率值
+            pred_probs = torch.sigmoid(pred_slice)  # (num_valid_samples, num_frames)
+
             # 计算加权BCE损失
-            loss = F.binary_cross_entropy_with_logits(
-                pred_slice, target, reduction='none'
+            loss = F.binary_cross_entropy(
+                pred_probs, target, reduction='none'
             )
 
+            # # 计算加权BCE损失
+            # loss = F.binary_cross_entropy_with_logits(
+            #     pred_slice, target, reduction='none'
+            # )
+
             # 动态权重，赋予较难的类别较高的权重
-            weight = (target * (1 - target)).pow(self.gamma)  # 使用 gamma 计算权重
+            weight = torch.abs(pred_probs - target)  # 使用 gamma 计算权重
+            weight = torch.pow(weight, self.gamma)
             loss = (loss * weight).mean()
             # loss = loss.mean()  # 先不用weight
 
@@ -312,7 +469,7 @@ class SetCriterionOl(nn.Module):
             total_loss += loss
 
         # 平均损失
-        losses['loss_label'] = total_loss / 3  # 3 表示 start, middle, end
+        losses['loss_label'] = total_loss
 
         return losses
 
@@ -508,6 +665,8 @@ def build_model(args):
         input_dropout=args.input_dropout,
         span_loss_type=args.span_loss_type,
         n_input_proj=args.n_input_proj,
+        compress_len=args.compress_len,
+        use_vid_compression=args.use_vid_compression
     )
 
     matcher = build_matcher(args)
@@ -522,8 +681,11 @@ def build_model(args):
     }
     
     # 条件性添加损失项
-    # losses = ['labels', 'saliency', 'span']
-    losses = ['saliency', 'span']
+    losses = ['labels', 'saliency', 'span']
+    
+    # loss_label消融实验
+    # losses = ['labels', 'saliency']
+
     
     criterion = SetCriterionOl(
         weight_dict=weight_dict, 

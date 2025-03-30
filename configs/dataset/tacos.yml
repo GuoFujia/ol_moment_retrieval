@@ -1,11 +1,19 @@
 dset_name: tacos
 clip_length: 2
-train_path: /home/gfj/lighthouse-main/data/tacos/tacos_train_release.jsonl
-eval_path: /home/gfj/lighthouse-main/data/tacos/tacos_test_release.jsonl
-max_v_l: -1
+# train_path: /home/gfj/lighthouse-main/data/tacos/tacos_train_release.jsonl
+# eval_path: /home/gfj/lighthouse-main/data/tacos/tacos_test_release.jsonl
+train_path: /home/gfj/lighthouse-main/data/tacos/tacos_new_train_release.jsonl
+eval_path: /home/gfj/lighthouse-main/data/tacos/tacos_new_test_release.jsonl
+max_v_l: 1000
 max_q_l: 100
 eval_bsz: 32
+
+short_memory_len : 8
+long_memory_sample_len: 64
+future_memory_sample_len: 0
 
 lw_saliency: 4
 lr: 0.0002
 lr_drop: 40
+
+compress_len: 16

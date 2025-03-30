@@ -226,30 +226,20 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
 
         # saliency scores
         _saliency_scores = outputs["saliency_scores"].half()  # (bsz, short_memory_length)
-        
-        # if not model.training:
-        #     # 非训练模式：saliency_scores 的形状是 (bsz,)
-        #     # 将其扩展为 (bsz, 1) 以匹配后续逻辑
-        #     _saliency_scores = _saliency_scores.unsqueeze(-1)  # (bsz, 1)
-        # else:
-        #     # 训练模式：saliency_scores 的形状是 (bsz, short_memory_length)
-        #     pass  # 无需修改
 
+        # print("_saliency_scores.shape:", _saliency_scores.shape)
+        # input("check _saliency_scores...")
+        
         saliency_scores = []
 
-        short_st = model_inputs["memory_len"][0]
-        short_ed = model_inputs["memory_len"][0] + model_inputs["memory_len"][1]
-        src_vid_mask_short = model_inputs["src_vid_mask"][:, short_st:short_ed]  # 保留batch维度
+        c, b = model_inputs["memory_len"][2], model_inputs["memory_len"][1]
+        src_vid_mask_short = model_inputs["src_vid_mask"][:, -(c + b):-c] if c > 0 else model_inputs["src_vid_mask"][:, -b:]
         valid_vid_lengths = src_vid_mask_short.sum(1).cpu().tolist()
 
-        # print("in compute mr results, model's output length is :",outputs["frame_pred"].shape)
-        # print("first 5 outputs frame_pred:", outputs["frame_pred"][:5])
-        # print("first 5 outputs saliency_scores:", outputs["saliency_scores"][:5])
-        # print("first 5 chunk idx:", model_inputs["chunk_idx"][:5])
-        # print("first 5 memory len:", model_inputs["memory_len"][:5])
-        # print("first 5 src vid mask:", model_inputs["src_vid_mask"][:5])
-        # print("valid_vid_lengths", valid_vid_lengths)
-        # input("press enter to continue...")
+        # print("valid_vid_lengths:", valid_vid_lengths)
+        # print("valid_vid_lengths len:", len(valid_vid_lengths))
+        # print("src_vid_mask_short.shape:", src_vid_mask_short.shape)
+        # input("check valid_vid_lengths...")
 
         for j in range(len(valid_vid_lengths)):
             valid_length = int(valid_vid_lengths[j])
@@ -353,7 +343,6 @@ def build_model(opt):
 
 def setup_model(opt):
     """setup model/optimizer/scheduler and load checkpoints when needed"""
-    #   ol任务需要的模型后续需要添加进来
     logger.info("setup model/optimizer/scheduler")
     model, criterion = build_model(opt)
 
@@ -362,6 +351,30 @@ def setup_model(opt):
         model.to(opt.device)                    
         criterion.to(opt.device)
 
+    print(opt)
+    # 添加权重加载逻辑
+    if 'model_path' in opt and opt.model_path:
+        logger.info(f"Loading model weights from {opt.model_path}")
+        try:
+            # 加载 checkpoint 文件
+            checkpoint = torch.load(opt.model_path, map_location=opt.device)
+            # 将权重加载到模型中
+            model.load_state_dict(checkpoint['model'], strict=False)  # strict=False 允许部分加载
+            logger.info("Model weights loaded successfully (strict=False).")
+        except Exception as e:
+            logger.error(f"Failed to load model weights: {e}")
+            raise
+    else:
+        logger.info("No model path provided. Using random initialization.")
+
+    # 在加载权重后，判断是否冻结 transformer 的参数
+    if "froze_transformer" in opt and opt.froze_transformer:
+        for name, param in model.named_parameters():
+            if "transformer" in name:  # 冻结所有 transformer 相关的参数
+                param.requires_grad = False
+                logger.info(f"Froze parameter: {name}")
+
+    # 设置优化器和学习率调度器
     param_dicts = [{"params": [p for n, p in model.named_parameters() if p.requires_grad]}]
     optimizer = torch.optim.AdamW(param_dicts, lr=opt.lr, weight_decay=opt.wd)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, opt.lr_drop)
@@ -397,9 +410,9 @@ def start_inference(opt, domain=None):
         load_labels=load_labels,
         #   ol任务需要的参数
         chunk_interval=1,
-        short_memory_sample_length=8,
-        long_memory_sample_length=16,
-        future_memory_sample_length=8,
+        short_memory_sample_length=opt.short_memory_len,
+        long_memory_sample_length=opt.long_memory_sample_len,
+        future_memory_sample_length=opt.future_memory_sample_len,
         short_memory_stride=1,
         long_memory_stride=1,
         future_memory_stride=1,

@@ -2,3 +2,9 @@ dset_name: qvhighlight
 clip_length: 2
 train_path: /home/gfj/lighthouse-main/data/qvhighlight/highlight_train_release.jsonl
 eval_path: /home/gfj/lighthouse-main/data/qvhighlight/highlight_val_release.jsonl
+
+short_memory_len : 8
+long_memory_sample_len: 64
+future_memory_sample_len: 0
+
+compress_len: 16

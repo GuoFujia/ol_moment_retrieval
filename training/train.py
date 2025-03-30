@@ -82,36 +82,36 @@ def set_seed(seed, use_cuda=True):
         torch.cuda.manual_seed_all(seed)
 
 
-def additional_trdetr_losses(model_inputs, outputs, targets, opt):
-    # TR-DETR only loss
-    src_txt_mask,   src_vid_mask = model_inputs['src_txt_mask'], model_inputs['src_vid_mask']
-    pos_mask =  targets['src_pos_mask'] 
+# def additional_trdetr_losses(model_inputs, outputs, targets, opt):
+#     # TR-DETR only loss
+#     src_txt_mask,   src_vid_mask = model_inputs['src_txt_mask'], model_inputs['src_vid_mask']
+#     pos_mask =  targets['src_pos_mask'] 
 
-    src_txt_ed, src_vid_ed =  outputs['src_txt_ed'], outputs['src_vid_ed']
-    loss_align = CTC_Loss()
-    loss_vid_txt_align = loss_align(src_vid_ed, src_txt_ed, pos_mask, src_vid_mask, src_txt_mask)
+#     src_txt_ed, src_vid_ed =  outputs['src_txt_ed'], outputs['src_vid_ed']
+#     loss_align = CTC_Loss()
+#     loss_vid_txt_align = loss_align(src_vid_ed, src_txt_ed, pos_mask, src_vid_mask, src_txt_mask)
 
-    src_vid_cls_ed = outputs['src_vid_cls_ed']
-    src_txt_cls_ed = outputs['src_txt_cls_ed']
-    loss_align_VTC = VTCLoss()
-    loss_vid_txt_align_VTC = loss_align_VTC(src_txt_cls_ed, src_vid_cls_ed)
+#     src_vid_cls_ed = outputs['src_vid_cls_ed']
+#     src_txt_cls_ed = outputs['src_txt_cls_ed']
+#     loss_align_VTC = VTCLoss()
+#     loss_vid_txt_align_VTC = loss_align_VTC(src_txt_cls_ed, src_vid_cls_ed)
 
-    loss = opt.VTC_loss_coef * loss_vid_txt_align_VTC + opt.CTC_loss_coef * loss_vid_txt_align
-    return loss
+#     loss = opt.VTC_loss_coef * loss_vid_txt_align_VTC + opt.CTC_loss_coef * loss_vid_txt_align
+#     return loss
 
-def calculate_taskweave_losses(loss_dict, weight_dict, hd_log_var, mr_log_var):
-    # TaskWeave only loss
-    grouped_losses = {"loss_mr": [], "loss_hd": []}
-    for k in loss_dict.keys():
-        if k in weight_dict:
-            if any(keyword in k for keyword in ["giou", "span", "label",'class_error']):
-                grouped_losses["loss_mr"].append(loss_dict[k])
-            elif "saliency" in k:
-                grouped_losses["loss_hd"].append(loss_dict[k])
-    loss_mr = sum(grouped_losses["loss_mr"])
-    loss_hd = sum(grouped_losses["loss_hd"])
-    losses = 2 * loss_hd * torch.exp(-hd_log_var) + 1 * loss_mr * torch.exp(-mr_log_var) + hd_log_var + mr_log_var
-    return losses
+# def calculate_taskweave_losses(loss_dict, weight_dict, hd_log_var, mr_log_var):
+#     # TaskWeave only loss
+#     grouped_losses = {"loss_mr": [], "loss_hd": []}
+#     for k in loss_dict.keys():
+#         if k in weight_dict:
+#             if any(keyword in k for keyword in ["giou", "span", "label",'class_error']):
+#                 grouped_losses["loss_mr"].append(loss_dict[k])
+#             elif "saliency" in k:
+#                 grouped_losses["loss_hd"].append(loss_dict[k])
+#     loss_mr = sum(grouped_losses["loss_mr"])
+#     loss_hd = sum(grouped_losses["loss_hd"])
+#     losses = 2 * loss_hd * torch.exp(-hd_log_var) + 1 * loss_mr * torch.exp(-mr_log_var) + hd_log_var + mr_log_var
+#     return losses
 
 def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i):
     batch_input_fn = prepare_batch_inputs_ol  
@@ -127,38 +127,22 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i):
     other_count = 0       # 统计其他类别（start, mid, end）的预测次数
 
     num_training_examples = len(train_loader)
-    timer_dataloading = time.time()
     for batch_idx, batch in tqdm(enumerate(train_loader),
                                  desc="Training Iteration",
                                  total=num_training_examples):
         metas, batched_inputs = batch
         model_inputs, targets = batch_input_fn(metas,batched_inputs, opt.device)
         
-        if opt.model_name == 'taskweave':
-            model_inputs['epoch_i'] = epoch_i  # taskweave 需要 epoch 编号
-            outputs, [hd_log_var, mr_log_var] = model(**model_inputs)
-            loss_dict = criterion(outputs, targets)
-            total_loss, losses = calculate_taskweave_losses(loss_dict, criterion.weight_dict, hd_log_var, mr_log_var)
-            optimizer.zero_grad()
-            losses.backward()
-        else:
-            outputs = model(**model_inputs)  
-            total_loss, loss_dict = criterion(outputs, targets)
-            # losses = sum(loss_dict[k] * criterion.weight_dict[k] for k in loss_dict.keys() if k in criterion.weight_dict)
+        outputs = model(**model_inputs)  
+        total_loss, loss_dict = criterion(outputs, targets)
+        # losses = sum(loss_dict[k] * criterion.weight_dict[k] for k in loss_dict.keys() if k in criterion.weight_dict)
 
-            # 不用weight_dict，将loss简单相加
-            losses = total_loss
-               
-            # print("total_loss",total_loss)
-            # print("loss_dict",loss_dict)
-            # print("weight_dict",criterion.weight_dict)
-            # print("losses",losses)
-            # print(f"losses grad_fn: {losses.grad_fn}")
-            # input("linggangu")
-            
-            optimizer.zero_grad()
-            losses.backward()
+        # 不用weight_dict，将loss简单相加
+        losses = total_loss
         
+        optimizer.zero_grad()
+        losses.backward()
+            
         if opt.grad_clip > 0:
             nn.utils.clip_grad_norm_(model.parameters(), opt.grad_clip)
         optimizer.step()
@@ -218,18 +202,11 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
                         # eval_epoch(epoch_i, model, val_dataset, opt, save_submission_filename, criterion)
 
 
-            # 修改日志记录部分，适应新的 metrics 结构
+            # 修改日志记录部分
             write_log(opt, epoch_i, eval_loss_meters, metrics=metrics, mode='val')            
             logger.info("metrics {}".format(pprint.pformat(metrics, indent=4)))
             
-            # 根据新的 metrics 结构选择停止分数
-            if opt.dset_name == 'tvsum' or opt.dset_name == 'youtube_highlight':
-            # 如果数据集是 tvsum 或 youtube_highlight，使用 saliency_mse 作为停止分数
-                stop_score = -metrics["saliency_mse"]  # 越小越好，取负值
-            else:
-                # 对于其他数据集，使用片段定位的 R@1分数 作为停止分数
-                stop_score = metrics["R@1,IoU=0.5"] + metrics["R@1,IoU=0.7"]
-
+            stop_score = metrics["R@1,IoU=0.5"] + metrics["R@1,IoU=0.7"]
             # 如果当前分数优于之前的最佳分数，则保存模型
             if stop_score > prev_best_score:
                 prev_best_score = stop_score
@@ -261,9 +238,9 @@ def main(opt, resume=None, domain=None):
         load_labels=True,
         # OL 任务所需的参数
         chunk_interval=1,
-        short_memory_sample_length=8,
-        long_memory_sample_length=16,
-        future_memory_sample_length=8,
+        short_memory_sample_length=opt.short_memory_len,
+        long_memory_sample_length=opt.long_memory_sample_len,
+        future_memory_sample_length=opt.future_memory_sample_len,
         short_memory_stride=1,
         long_memory_stride=1,
         future_memory_stride=1,
@@ -329,6 +306,8 @@ if __name__ == '__main__':
                         choices=['resnet_glove', 'clip', 'clip_slowfast', 'clip_slowfast_pann', 'i3d_clip', 'clap'],
                         help='feature name. select from [resnet_glove, clip, clip_slowfast, clip_slowfast_pann, i3d_clip, clap].'
                              'NOTE: i3d_clip and clip_slowfast_pann are only for TVSum and QVHighlight, respectively.')
+    parser.add_argument('--model_path', type=str, help='train from a saved model path')
+    parser.add_argument('--froze_transformer', type=bool, default=False, help='froze transformer')
     parser.add_argument('--resume', '-r', type=str, help='specify model path for fine-tuning. If None, train the model from scratch.')
     parser.add_argument('--domain', '-dm', type=str,
                         choices=['BK', 'BT', 'DS', 'FM', 'GA', 'MS', 'PK', 'PR', 'VT', 'VU',
@@ -344,6 +323,9 @@ if __name__ == '__main__':
         option_manager.parse()
         option_manager.clean_and_makedirs()
         opt = option_manager.option
+        
+        opt.model_path = args.model_path
+        opt.froze_transformer = args.froze_transformer
         main(opt, resume=args.resume, domain=args.domain)
     else:
         raise ValueError('The combination of dataset, feature, and domain is invalid: dataset={}, feature={}, domain={}'.format(args.dataset, args.feature, args.domain))

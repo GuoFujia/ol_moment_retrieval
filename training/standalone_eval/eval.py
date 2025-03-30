@@ -488,6 +488,37 @@ def eval_submission_ol(submission, ground_truth, saliency_scores_all, verbose=Tr
 
     return final_eval_metrics
 
+def downsample_scores(anno_score, 
+                        smooth_window_len=3,
+                        downsample_stride=4,
+                        min_num_segments=128):
+    """Downsample the predicted scores time sequence.
+    Args:
+        anno_score (np.array):
+        min_window_length (int): Window length of Mean filter.
+    """
+    total_num_clips = anno_score.shape[0]
+    if total_num_clips > min_num_segments:
+        # Smoothing
+        anno_score[:, 0] = signal.medfilt(anno_score[:, 0], 
+                                            smooth_window_len)
+        anno_score[:, 1] = signal.medfilt(anno_score[:, 1], 
+                                            smooth_window_len)
+        anno_score[:, 2] = signal.medfilt(anno_score[:, 2], 
+                                            smooth_window_len)
+        # Downsampling
+        num_segments = max(min_num_segments, total_num_clips//downsample_stride)
+        if total_num_clips != num_segments:
+            indices = np.linspace(0, total_num_clips-1, num_segments).astype(np.int32)
+            anno_score_downsampled = anno_score[indices]
+        else:
+            anno_score_downsampled = anno_score
+    else:
+        # No downsample for short videos
+        anno_score_downsampled = anno_score
+        num_segments = total_num_clips
+    return anno_score_downsampled, num_segments
+
 def eval_submission_ol_2(submission, ground_truth, saliency_scores_all, 
                       verbose=True, match_number=True, n_list=(1, 5), iou_thresholds=(0.5, 0.7)):
   
@@ -530,92 +561,47 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
             matched_data_grouped[key] = []
         matched_data_grouped[key].append((sub, gt))
     
-    # 对每组内的样本按照时间顺序排序
+    # # 对每组内的样本按照时间顺序排序
+    # for key in matched_data_grouped:
+    #     matched_data_grouped[key].sort(key=lambda x: x[1]["short_memory_start"])
+        
+    #     # 拼接每组内的预测标签
+    #     for i in range(len(matched_data_grouped[key])-1):
+    #         cur_sub, cur_gt = matched_data_grouped[key][i]
+    #         next_sub, next_gt = matched_data_grouped[key][i+1]
+            
+    #         # 拼接frame_prob预测
+    #         cur_sub["pred_frame_prob"].extend(next_sub["pred_frame_prob"][:,-1,:].unsqueeze(1))
+            
+    #         # 拼接saliency_scores预测(如果存在)
+    #         if "pred_saliency_scores" in cur_sub and "pred_saliency_scores" in next_sub:
+    #             cur_sub["pred_saliency_scores"].extend(next_sub["pred_saliency_scores"][:,-1].unsqueeze(1))
+
+    eval_interval = 2   # 需要和onlinedataset中，val时的采样间隔保持一致
     for key in matched_data_grouped:
         matched_data_grouped[key].sort(key=lambda x: x[1]["short_memory_start"])
-        
-        # 拼接每组内的预测标签
-        for i in range(len(matched_data_grouped[key])-1):
-            cur_sub, cur_gt = matched_data_grouped[key][i]
-            next_sub, next_gt = matched_data_grouped[key][i+1]
+    
+        if len(matched_data_grouped[key]) > 0:
+            # 第一个样本保留全部内容
+            main_sub, main_gt = matched_data_grouped[key][0]
             
-            # 拼接frame_prob预测
-            cur_sub["pred_frame_prob"].extend(next_sub["pred_frame_prob"])
-            
-            # 拼接saliency_scores预测(如果存在)
-            if "pred_saliency_scores" in cur_sub and "pred_saliency_scores" in next_sub:
-                cur_sub["pred_saliency_scores"].extend(next_sub["pred_saliency_scores"])
-
-    # 打印部分匹配的gt和pred
-    # print("部分匹配的gt和pred:")
-    # for key in matched_data_grouped:
-    #     print(f"query: {key[0]}, video: {key[1]}")
-    #     for sub, gt in matched_data_grouped[key]:
-    #         print(f"gt: {gt['short_memory_start']}, pred: {sub['pred_start']}")
-    # input("请按回车键继续...")
-
-    # ================== 1.5. 添加8个列表用于存储预测值和真实值 ==================
-    pred_st_probs = []  # 预测的帧作为st的概率
-    pred_mid_probs = []  # 预测的帧作为mid的概率
-    pred_ed_probs = []  # 预测的帧作为ed的概率
-    pred_saliency_scores = []  # 预测的帧的显著性分数
-    gt_st_labels = []  # 真实的帧作为st的标签
-    gt_mid_labels = []  # 真实的帧作为mid的标签
-    gt_ed_labels = []  # 真实的帧作为ed的标签
-    gt_saliency_scores = []  # 真实的帧的显著性分数
-
-    # 遍历每组数据，填充上述8个列表
-    for key, group in matched_data_grouped.items():
-        for sub, gt in group:
-            # 获取预测的概率和显著性分数
-            pred_st_probs.extend(np.array(sub["pred_frame_prob"])[:, 0])
-            pred_mid_probs.extend(np.array(sub["pred_frame_prob"])[:, 1])
-            pred_ed_probs.extend(np.array(sub["pred_frame_prob"])[:, 2])
-            # pred_st_probs.append(sub["pred_frame_prob"][0])
-            # pred_mid_probs.append(sub["pred_frame_prob"][1])
-            # pred_ed_probs.append(sub["pred_frame_prob"][2])
-            if "pred_saliency_scores" in sub:
-                pred_saliency_scores.extend(sub["pred_saliency_scores"])
-
-            # 获取真实的标签和显著性分数
-            gt_st_labels.extend(gt["start_label"])
-            gt_mid_labels.extend(gt["middle_label"])
-            gt_ed_labels.extend(gt["end_label"])
-            vid = gt["vid"]
-            st = gt["short_memory_start"]
-            ed = st + len(sub["pred_frame_prob"])
-            gt_saliency_scores.extend(saliency_scores_all[vid, gt["qid"]][st:ed])
-
-    # print("传入的submission长度：", len(submission))
-    # print("matched_data长度：", len(matched_data))
-    # print("matched_data_grouped长度：", len(matched_data_grouped))
-
-    # print("submission:", submission[:5])
-    # input("请按回车键继续...")
-    # print("submission:", submission)
-
-    # print("ground_truth:", ground_truth[:5])
-    # input("请按回车键继续...")
-    # print("ground_truth:", ground_truth)
-
-    # print("matched_data_grouped:", matched_data_grouped)
-    # input("请按回车键继续...")
-
-    # print("matched_data:", matched_data[:10])
-    # input("请按回车键继续...")
-
-    # print("pred_st_probs:", pred_st_probs[:5])
-    # print("gt_st_labels:", gt_st_labels[:5])
-
-    # print("pred_mid_probs:", pred_mid_probs[:5])
-    # print("gt_mid_labels:", gt_mid_labels[:5])
-
-    # print("pred_ed_probs:", pred_ed_probs[:5])
-    # print("gt_ed_labels:", gt_ed_labels[:5])
-
-    # print("pred_saliency_scores:", pred_saliency_scores[:5])
-    # print("gt_saliency_scores:", gt_saliency_scores[:5])
-    # input("请按回车键继续...")
+            # 处理后续样本
+            for i in range(1, len(matched_data_grouped[key])):
+                cur_sub, _ = matched_data_grouped[key][i]
+                
+                # 处理frame_prob预测
+                if "pred_frame_prob" in cur_sub and len(cur_sub["pred_frame_prob"]) > 0:
+                    # 取最后一个时间步的所有特征值（即最后一个子列表）
+                    last_time_step_features = cur_sub["pred_frame_prob"][-eval_interval:]
+                    # 添加到主样本中
+                    main_sub["pred_frame_prob"].extend(last_time_step_features)
+                
+                # 处理saliency_scores预测（如果存在）
+                if "pred_saliency_scores" in main_sub and "pred_saliency_scores" in cur_sub:
+                    if len(cur_sub["pred_saliency_scores"]) > 0:
+                        # 同样取最后一个时间步的值
+                        last_saliency = cur_sub["pred_saliency_scores"][-eval_interval:]
+                        main_sub["pred_saliency_scores"].extend(last_saliency)
 
     # ================== 2. 片段定位评估（R@n, IoU=m）==================
     r_at_n_metrics = OrderedDict()
@@ -631,23 +617,56 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
         _, first_gt = group[0]
         clip_length = first_gt["duration_frame"]
 
-        # 收集该组内所有的预测概率
-        all_st_probs = []
-        all_ed_probs = []
-        all_pred_starts = []
-        for sub, _ in group:
-            all_st_probs.extend(np.array(sub["pred_frame_prob"])[:, 0])
-            all_ed_probs.extend(np.array(sub["pred_frame_prob"])[:, 2])
-            all_pred_starts.extend([sub["pred_start"]] * len(sub["pred_frame_prob"]))
-            all_pred_starts = [x + 8 for x in all_pred_starts]
+        # # 收集该组内所有的预测概率
+        # all_st_probs = []
+        # all_ed_probs = []
+        # all_pred_starts = []
+        # for sub, _ in group:
+        #     all_st_probs.extend(np.array(sub["pred_frame_prob"])[:, 0])
+        #     all_ed_probs.extend(np.array(sub["pred_frame_prob"])[:, 2])
+        #     all_pred_starts.extend([sub["pred_start"]] * len(sub["pred_frame_prob"]))
+        #     all_pred_starts = [x + 8 for x in all_pred_starts]
+
+        all_pred_indices = []  # 替换原来的 all_pred_starts
+        all_st_probs = [item[0] for item in group[0][0]["pred_frame_prob"]]
+        all_mid_probs = [item[1] for item in group[0][0]["pred_frame_prob"]]
+        all_ed_probs = [item[2] for item in group[0][0]["pred_frame_prob"]]
+    
+        # 处理主样本（第一个样本）
+        main_sub, main_gt = group[0]
+        main_start = main_gt["short_memory_start"]
+        for t in range(len(main_gt["start_label"])):
+            all_pred_indices.append(main_start + t)  # 主样本的时间步索引
+        
+        # 处理后续样本（从第二个开始）
+        for i in range(1, len(group)):
+            cur_sub, cur_gt = group[i]
+            cur_start = cur_gt["short_memory_start"]
+            cur_length = len(cur_gt["start_label"])
+            
+            # 取最后 eval_interval 个时间步的索引
+            for t in range(eval_interval):
+                all_pred_indices.append(cur_start + cur_length - eval_interval + t)
+
+        # print("gt_data:", first_gt)
+        # print("gt_windows:", first_gt["gt_windows"])
+        # print("all_pred_indices:", all_pred_indices)
+        # print("all_st_probs:", all_st_probs)
+        # print("all_mid_probs:", all_mid_probs)
+        # print("all_ed_probs:", all_ed_probs)
+        # print("duration_frame:", clip_length)
 
         # 生成跨chunk的候选片段
         candidate_moments = generate_cross_chunk_candidate_moments(
-            pred_starts=all_pred_starts,
+            pred_starts=all_pred_indices,
             st_probs=all_st_probs,
             ed_probs=all_ed_probs,
             clip_length=clip_length
         )
+
+        # print("candidate_moments:", candidate_moments[:5])
+        # input("Press Enter to continue...")
+
 
         # 获取该组的所有真实片段并去重
         gt_spans_set = set()
@@ -673,42 +692,7 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
     total_queries = len(matched_data_grouped)
     for k in r_at_n_metrics:
         r_at_n_metrics[k] = round(r_at_n_metrics[k] / total_queries * 100, 2) if total_queries > 0 else 0.0
-
-    # # ================== 3. 显著性回归评估 ==================
-    # if "pred_saliency_scores" in submission[0]:
-    #     saliency_metrics = {"mse": 0.0, "mae": 0.0}
-    #     if len(matched_data) > 0:
-    #         from sklearn.metrics import mean_squared_error, mean_absolute_error
-            
-    #         pred_scores, gt_scores = [], []
-    #         for sub, gt in matched_data:
-    #             vid = gt["vid"]
-    #             st = gt["short_memory_start"]
-                
-    #             # 获取预测分数
-    #             pred_scores_chunk = sub["pred_saliency_scores"]
-                
-    #             # 获取ground truth分数
-    #             ed = st + len(pred_scores_chunk)  # 使用预测分数的长度来确定结束位置
-    #             gt_scores_chunk = saliency_scores_all[vid,gt["qid"]][st:ed]
-                
-    #             # 确保长度匹配
-    #             min_len = min(len(pred_scores_chunk), len(gt_scores_chunk))
-    #             pred_scores.extend(pred_scores_chunk[:min_len])
-    #             gt_scores.extend(gt_scores_chunk[:min_len])
-
-    #             # print("saliency: gt:",gt_scores," sub:",pred_scores)
-    #             # input("please wait")
-                
-    #         # 再次验证长度
-    #         assert len(pred_scores) == len(gt_scores), \
-    #             f"Inconsistent lengths: pred_scores={len(pred_scores)}, gt_scores={len(gt_scores)}"
-            
-    #         # 计算指标
-    #         if len(pred_scores) > 0:
-    #             saliency_metrics["mse"] = mean_squared_error(gt_scores, pred_scores)
-    #             saliency_metrics["mae"] = mean_absolute_error(gt_scores, pred_scores)
-    
+        
     # ================== 3. 显著性回归评估with mAP and Hit1 ==================
     if "pred_saliency_scores" in submission[0]:
         # Convert predictions and ground truth to the format expected by evaluation
@@ -717,16 +701,52 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
         
         for key, group in matched_data_grouped.items():
             qid = key[0]
-            # Collect all predictions for this query
-            all_pred_scores = []
-            all_gt_scores = []
-            for sub, gt in group:
-                all_pred_scores.extend(sub["pred_saliency_scores"])
-                vid = gt["vid"]
-                st = gt["short_memory_start"]
-                ed = st + len(sub["pred_frame_prob"])
-                all_gt_scores.extend(saliency_scores_all[vid, gt["qid"]][st:ed])
+
+            all_pred_scores = list(group[0][0]["pred_saliency_scores"])  # 主样本的全部预测分数
+            all_gt_scores = list(saliency_scores_all[group[0][1]["vid"], group[0][1]["qid"]][
+                group[0][1]["short_memory_start"] : group[0][1]["short_memory_start"] + len(group[0][1]["saliency_all_labels"])
+            ])  # 主样本的全部GT分数
+
+            # 处理后续样本（从第二个开始）
+            for i in range(1, len(group)):
+                cur_sub, cur_gt = group[i]
+                vid = cur_gt["vid"]
+                cur_start = cur_gt["short_memory_start"]
+                cur_length = len(cur_gt["saliency_all_labels"])
+                
+                # 仅保留最后 eval_interval 个时间步的预测和GT
+                if cur_length > 0:
+                    last_n_gt = cur_gt["saliency_all_labels"][-eval_interval:]
+                    all_gt_scores.extend(last_n_gt)
+
+            # # Collect all predictions for this query
+            # all_pred_scores = []
+            # all_gt_scores = []
             
+            # # 第一个样本保留所有预测和对应的gt
+            # first_sub, first_gt = group[0]
+            # vid = first_gt["vid"]
+            # st = first_gt["short_memory_start"]
+            # ed = st + len(first_sub["pred_frame_prob"])
+            # all_pred_scores.extend(first_sub["pred_saliency_scores"])
+            # all_gt_scores.extend(saliency_scores_all[vid, first_gt["qid"]][st:ed])
+            
+            # # 后续样本只取最后eval_interval个时间步的预测和对应的gt
+            # for i in range(1, len(group)):
+            #     cur_sub, cur_gt = group[i]
+            #     vid = cur_gt["vid"]
+            #     st = cur_gt["short_memory_start"]
+            #     ed = st + len(cur_sub["pred_frame_prob"])
+                
+            #     # 取最后一个时间步的预测
+            #     if len(cur_sub["pred_saliency_scores"]) > 0:
+            #         last_pred = cur_sub["pred_saliency_scores"][-1]
+            #         all_pred_scores.append(last_pred)
+                
+            #     # 取最后一个时间步对应的gt
+            #     last_gt = saliency_scores_all[vid, cur_gt["qid"]][ed-1]
+            #     all_gt_scores.append(last_gt)
+
             # Create prediction entry
             qid2preds[qid] = {
                 "qid": qid,
@@ -759,7 +779,6 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
                 for k, v in qid2gt_scores_full_range.items()
             }
             
-            # Calculate metrics using single annotator scores
             hit_at_one = float(f"{100 * np.mean([np.max(qid2gt_scores_binary[qid][np.argmax(qid2preds[qid]['pred_saliency_scores'])]) for qid in qid2preds]):.2f}")
             
             # Calculate AP for each query using single annotator scores

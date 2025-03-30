@@ -1,4 +1,5 @@
 import math
+import sys
 import torch
 from torch.utils.data import Dataset
 import numpy as np
@@ -26,11 +27,11 @@ class StartEndDataset(Dataset):
     }
     """
     def __init__(self, dset_name, domain, data_path, v_feat_dirs, a_feat_dirs, q_feat_dir,
+                 short_memory_sample_length, long_memory_sample_length, future_memory_sample_length, 
                  q_feat_type="last_hidden_state", v_feat_types="clip", a_feat_types="pann", 
-                 max_q_l=32, max_v_l=75, max_a_l=75, ctx_mode="video", clip_len=2,
+                 max_q_l=500, max_v_l=2000, max_a_l=75, ctx_mode="video", clip_len=2,
                  max_windows=5, span_loss_type="l1", load_labels=True,
-                 chunk_interval=1, short_memory_sample_length=8, long_memory_sample_length=16,
-                 future_memory_sample_length=8, short_memory_stride=1, long_memory_stride=1,
+                 chunk_interval=1, short_memory_stride=1, long_memory_stride=1,
                  future_memory_stride=1, load_future_memory=False,test_mode=False,
                  use_gaussian_labels=True, alpha_s=0.25, alpha_m=0.21, alpha_e=0.25,
                  pos_expansion_ratio=1., neg_pos_ratio=3,):
@@ -84,16 +85,15 @@ class StartEndDataset(Dataset):
         #   加载chunk sample_flag用到的参数
         self.neg_pos_ratio = neg_pos_ratio
         self.pos_expansion_ratio = pos_expansion_ratio
+
+        print("for dataset ", self.dset_name, " the short_memory_sample_length is ", 
+            self.short_memory_sample_length, " the long_memory_sample_length is ", 
+        self.long_memory_sample_length, " the future_memory_sample_length is ", 
+        self.future_memory_sample_length)
         
         # data
         self.data = self.load_data()
-
-        # 如果是activitynet或者tacos数据集，则均匀采样部分视频样本来降低内存消耗，并减少训练时间  
-        if self.dset_name == "activitynet":
-            self.data = self.data[:len(self.data)//4]
-        elif self.dset_name == "tacos" and self.test_mode:
-            self.data = self.data[:len(self.data)//4]
-
+        # self.data = self.data[:len(self.data)//16]
         self.load_saliency_scores() 
 
         # 分块信息
@@ -108,35 +108,35 @@ class StartEndDataset(Dataset):
             self.embedding = nn.Embedding.from_pretrained(self.vocab.vectors)
         
     def load_saliency_scores(self):        
-        if len(self.data)==0:
-            print("none data is loaded, cant load saliency scores")
+        if len(self.data) == 0:
+            print("No data is loaded, can't load saliency scores")
             return
-        elif self.saliency_scores_list==None:
-            self.saliency_scores_list={}
+        elif self.saliency_scores_list is None:
+            self.saliency_scores_list = {}
 
         if self.dset_name == "qvhighlight" and "subs_train" not in self.data_path: 
-            for line in self.data:
-                # duration_frame = int(line["duration"] * self.fps)
+            # 第一个循环添加tqdm
+            for line in tqdm(self.data, desc="Loading qvhighlight saliency scores"):
                 duration_frame = len(self._get_video_feat_by_vid(line["vid"]))
                 all_vid_scores = np.zeros(duration_frame, dtype=float)
+                
                 for idx, scores in enumerate(line["saliency_scores"]):
                     if line["relevant_clip_ids"][idx] < duration_frame:
                         all_vid_scores[line["relevant_clip_ids"][idx]] = np.mean(scores)
-                self.saliency_scores_list[(line["vid"],line["qid"])]= all_vid_scores
+                
+                self.saliency_scores_list[(line["vid"], line["qid"])] = all_vid_scores
         else:
-            #   加载sub_as_query分数
-            for line in self.data:
-                # 按照lighthosue用的数据集，feat也是2s一次采样，相当于fps也是0.5
-                # 然后feat的长度就是duration/2，再向上取整（tacos等视频长度不一定是整数）
-
-                # duration_frame = math.ceil(line["duration"] * self.fps)
+            # 第二个循环添加tqdm
+            for line in tqdm(self.data, desc="Loading sub-as-query saliency scores"):
                 duration_frame = len(self._get_video_feat_by_vid(line["vid"]))
                 all_vid_scores = np.zeros(duration_frame, dtype=float)
+                
                 for windows in line["relevant_windows"]:
                     start_frame = math.floor(windows[0] * self.fps)
                     end_frame = math.floor(windows[1] * self.fps)
                     all_vid_scores[start_frame:end_frame] = 1
-                self.saliency_scores_list[(line["vid"],line["qid"])]= all_vid_scores
+                
+                self.saliency_scores_list[(line["vid"], line["qid"])] = all_vid_scores
 
     def chunk_all_videos(self):
         """分块所有视频并生成软标签
@@ -159,13 +159,16 @@ class StartEndDataset(Dataset):
 
             # 计算目标片段位置
             gt_windows = line["relevant_windows"]
-            for idx, windows in enumerate(gt_windows):
-                gt_windows[idx] = [math.floor(windows[0] * self.fps), math.floor(windows[1] * self.fps)]
-            
+            # 这个计算出来的直接就是0开头的index，且是左闭右开的
+            if self.dset_name == "qvhighlight":
+                for idx, windows in enumerate(gt_windows):
+                    gt_windows[idx] = [math.floor(windows[0] * self.fps), math.floor(windows[1] * self.fps)]
+            elif self.dset_name in ["tacos", "activitynet"]:
+                for idx, windows in enumerate(gt_windows):
+                    gt_windows[idx] = [math.floor(windows[0] * self.fps), math.ceil(windows[1] * self.fps)]
             # 确定chunk的起始位置
             if not self.test_mode:
                 interval = self.chunk_interval - 1 + self.short_memory_sample_length
-                # interval = self.chunk_interval - 1 + self.short_memory_sample_length + 4
                 offset = np.random.randint(interval)
                 while(duration_frame - offset <= 0):
                     offset = np.random.randint(interval)
@@ -316,53 +319,58 @@ class StartEndDataset(Dataset):
         print(f"Generated {len(valid_chunk_infos)} valid chunks out of {total_length} total chunks, line_cnt: {line_cnt}")
 
         return valid_chunk_infos, len(valid_chunk_infos)
-
     def generate_gaussian_labels(self, video_length, start_idx, end_idx):
-        """生成高斯软标签"""
-        # start_idx, end_idx：当前GT片段的起始帧和结束帧
-        # video_length：视频总帧数
-        # 返回值：完整视频对于当前GT片段的软标签，包含start, middle, end三个维度
-        try:
-            # 计算中间点位置
-            middle_idx = (start_idx + end_idx) / 2
-            
-            # 处理 start_idx 等于 end_idx 的情况
-            if start_idx == end_idx:
-                # 为单帧事件设置一个小的有效宽度
-                min_sigma = 1.0  # 最小标准差
-                
-                # 生成时间序列
-                t = torch.arange(video_length, dtype=torch.float)
-                
-                # 为单帧事件生成集中的高斯分布
-                y_s = torch.exp(-((t - start_idx) ** 2) / (2 * min_sigma ** 2))
-                y_m = torch.exp(-((t - middle_idx) ** 2) / (2 * min_sigma ** 2))
-                y_e = torch.exp(-((t - end_idx) ** 2) / (2 * min_sigma ** 2))
-            else:
-                duration = end_idx - start_idx
-                # 计算标准差
-                sigma_s = self.alpha_s * duration
-                sigma_m = self.alpha_m * duration
-                sigma_e = self.alpha_e * duration
-                
-                # 生成时间序列
-                t = torch.arange(video_length, dtype=torch.float)
-                
-                # 使用 ** 运算符代替 pow 方法
-                y_s = torch.exp(-((t - start_idx) ** 2) / (2 * sigma_s ** 2))
-                y_m = torch.exp(-((t - middle_idx) ** 2) / (2 * sigma_m ** 2))
-                y_e = torch.exp(-((t - end_idx) ** 2) / (2 * sigma_e ** 2))
+        """生成非对称和截断高斯的标签（左闭右开区间 [start_idx, end_idx)）"""
+        # 单帧事件处理（start_idx == end_idx-1）
+        if start_idx == end_idx - 1:
+            min_sigma = 1.0
+            t = torch.arange(video_length, dtype=torch.float)
+            return {
+                'start': torch.exp(-((t - start_idx) ** 2) / (2 * min_sigma ** 2)),
+                'middle': torch.exp(-((t - (start_idx+0.5)) ** 2) / (2 * min_sigma ** 2)),  # 中点
+                'end': torch.exp(-((t - (end_idx-1)) ** 2) / (2 * min_sigma ** 2))
+            }
 
-            for item in (y_s, y_m, y_e):
-                for score in item:
-                    if np.isnan(score):
-                        print("cur vid len, st, ed:", video_length, start_idx, end_idx)
-                        input("wait! nan occur!") 
-            
-            return {'start': y_s, 'middle': y_m, 'end': y_e}
-        except Exception as e:
-            print(f"Error in generate_gaussian_labels: {str(e)}")
-            return None
+        # 基础参数
+        t = torch.arange(video_length, dtype=torch.float)
+        duration = end_idx - start_idx  # 左闭右开区间的长度
+        middle_idx = start_idx + duration / 2  # 精确中点
+
+        # ---- 1. 设置扩展系数 ----
+        extension_ratio = 1.5
+
+        # ---- 2. 截断高斯语义标签 ----
+        sigma_m = self.alpha_m * duration * extension_ratio
+        y_m = torch.exp(-((t - middle_idx) ** 2) / (2 * sigma_m ** 2))
+        
+        # GT区间内强制为1（左闭右开）
+        gt_mask = (t >= start_idx) & (t < end_idx)
+        y_m[gt_mask] = 1.0
+
+        # ---- 3. 非对称开始/结束标签 ----
+        # 对start_idx使用左闭右开逻辑
+        y_s = self._asymmetric_gaussian(t, start_idx, duration, 'start')
+        # 对end_idx-1使用左闭右开逻辑（因为end_idx是开区间）
+        y_e = self._asymmetric_gaussian(t, end_idx-1, duration, 'end')
+
+        return {'start': y_s, 'middle': y_m, 'end': y_e}
+
+    def _asymmetric_gaussian(self, t, mu, duration, label_type):
+        """生成非对称高斯标签（调整为左闭右开逻辑）"""
+        ratio_ori = 0.1
+        ratio_new = 0.3
+        if label_type == 'start':
+            mask = (t < mu)
+            ratio_ori *= -1
+            ratio_new *= -1
+        else:  # end
+            mask = (t > mu)
+        
+        sigma = self.alpha_s * duration if label_type == 'start' else self.alpha_e * duration
+        s_ori = ratio_ori * (mu - t) + sigma
+        s_new = ratio_new * (t - mu) + sigma
+        s = torch.where(mask, s_ori, s_new)
+        return torch.exp(-((t - mu) ** 2) / (2 * s ** 2))
 
     def get_chunk_labels(self, chunk_info):
         """获取当前chunk的标签，考虑多个GT片段
@@ -451,7 +459,6 @@ class StartEndDataset(Dataset):
             query_feat = self._get_query_feat_by_qid(chunk_info["qid"])
         # 确保查询特征被正确添加到model_inputs中
         model_inputs["query_feat"] = query_feat
-        #?# 这里按照一定使用视频写了，但是保留了音视频对齐的逻辑. 要不还得给short，long，future分别添加max_v_l参数。后续有需要再加上这个逻辑
         #   video feature
         if self.use_video:
             whole_video_feature = self._get_video_feat_by_vid(chunk_info["vid"])  # (Lv, Dv)
@@ -466,38 +473,7 @@ class StartEndDataset(Dataset):
             if self.load_future_memory and self.future_memory_sample_length > 0:
                 model_inputs["video_feat_future"]=whole_video_feature[future_memory_start:future_memory_end:self.future_memory_stride] 
                 ctx_l_future=len(model_inputs["video_feat_future"])
-        #   audio feature
-        if self.use_audio:
-            whole_audio_feature = self._get_audio_feat_by_vid(chunk_info["vid"])  # (Lv, Dv)
-            #   short memory
-            model_inputs["audio_feat_short"]=whole_audio_feature[short_memory_start:short_memory_end:self.short_memory_stride]
-            ctx_l_a=len(model_inputs["audio_feat_short"])
-            if ctx_l_short < ctx_l_a:
-                model_inputs["audio_feat_short"] = model_inputs["audio_feat_short"][:ctx_l_short]
-            elif ctx_l_short > ctx_l_a:
-                if self.use_video:
-                    model_inputs["video_feat_short"] = model_inputs["video_feat_short"][:ctx_l_a] # TODO: Sometimes, audio length is not equal to video length.
-                ctx_l_short = ctx_l_a
-            #   long memory 
-            if self.long_memory_sample_length > 0:
-                model_inputs["audio_feat_long"]=whole_audio_feature[long_memory_start:long_memory_end:self.long_memory_stride]
-                ctx_l_a=len(model_inputs["audio_feat_long"])
-                if ctx_l_long < ctx_l_a:
-                    model_inputs["audio_feat_long"] = model_inputs["audio_feat_long"][:ctx_l_long]
-                elif ctx_l_long > ctx_l_a:
-                    if self.use_video:
-                        model_inputs["video_feat_long"] = model_inputs["video_feat_long"][:ctx_l_a] # TODO: Sometimes, audio length is not equal to video length.
-                    ctx_l_long = ctx_l_a 
-            #   future memory
-            if self.load_future_memory and self.future_memory_sample_length > 0:
-                model_inputs["audio_feat_future"]=whole_audio_feature[future_memory_start:future_memory_end:self.future_memory_stride] 
-                ctx_l_a=len(model_inputs["audio_feat_future"])
-                if ctx_l_long < ctx_l_a:
-                    model_inputs["audio_feat_future"] = model_inputs["audio_feat_future"][:ctx_l_future]
-                elif ctx_l_future > ctx_l_a:
-                    if self.use_video:
-                        model_inputs["video_feat_future"] = model_inputs["video_feat_future"][:ctx_l_a] # TODO: Sometimes, audio length is not equal to video length.
-                    ctx_l_future = ctx_l_a 
+
         #?# 这里如果使用tef编码的话，需要根据模型如何使用feat调整：是拼接后使用tef编码，还是分别进行tef编码
         if self.use_tef:
             #   short
@@ -532,30 +508,38 @@ class StartEndDataset(Dataset):
                     model_inputs["video_feat_future"] = tef_future
         # Span Label
         ## Short-term label
-        chunk_labels = self.get_chunk_labels(chunk_info)
-        if chunk_labels is not None:
-            model_inputs['start_label'] = chunk_labels['start_label']
-            model_inputs['middle_label'] = chunk_labels['middle_label']
-            model_inputs['end_label'] = chunk_labels['end_label']
-        else:
-            return None  # 如果标签生成失败，返回None
+        model_inputs["start_label"] = chunk_info["start_label"]
+        model_inputs["middle_label"] = chunk_info["middle_label"]
+        model_inputs["end_label"] = chunk_info["end_label"]
+
+        # chunk_labels = self.get_chunk_labels(chunk_info)
+        # if chunk_labels is not None:
+        #     model_inputs['start_label'] = chunk_labels['start_label']
+        #     model_inputs['middle_label'] = chunk_labels['middle_label']
+        #     model_inputs['end_label'] = chunk_labels['end_label']
+        # else:
+        #     return None  # 如果标签生成失败，返回None
         
         #   Saliency Label
-        boundary=[short_memory_start,short_memory_end]
-        if 'qvhighlight' in self.dset_name:
-            if "subs_train" in self.data_path: # for pretraining
-                model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
-                    self.get_saliency_labels_sub_as_query(boundary,chunk_info["gt_windows"], self.short_memory_sample_length)
-            else:
-                model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
-                    self.get_saliency_labels_all(chunk_info["gt_windows"],self.saliency_scores_list[chunk_info["vid"],chunk_info["qid"]],boundary)                        
+        model_inputs["saliency_pos_labels"] = chunk_info["saliency_pos_labels"]
+        model_inputs["saliency_neg_labels"] = chunk_info["saliency_neg_labels"]
+        model_inputs["saliency_all_labels"] = chunk_info["saliency_all_labels"]
         
-        elif self.dset_name in ['charades', 'tacos', 'activitynet', 'clotho-moment', 'unav100-subset', 'tut2017']:
-            model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
-                self.get_saliency_labels_sub_as_query(boundary,chunk_info["gt_windows"], self.short_memory_sample_length)
-        else:
-            raise NotImplementedError
-        #   或者这里返回的字典里可以直接用chunk_info
+        # boundary=[short_memory_start,short_memory_end]
+        # if 'qvhighlight' in self.dset_name:
+        #     if "subs_train" in self.data_path: # for pretraining
+        #         model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
+        #             self.get_saliency_labels_sub_as_query(boundary,chunk_info["gt_windows"], self.short_memory_sample_length)
+        #     else:
+        #         model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
+        #             self.get_saliency_labels_all(chunk_info["gt_windows"],self.saliency_scores_list[chunk_info["vid"],chunk_info["qid"]],boundary)                        
+        
+        # elif self.dset_name in ['charades', 'tacos', 'activitynet', 'clotho-moment', 'unav100-subset', 'tut2017']:
+        #     model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
+        #         self.get_saliency_labels_sub_as_query(boundary,chunk_info["gt_windows"], self.short_memory_sample_length)
+        # else:
+        #     raise NotImplementedError
+
         return dict(meta=chunk_info, model_inputs=model_inputs)
     
     def load_data(self):
@@ -597,9 +581,12 @@ class StartEndDataset(Dataset):
         all_pos_pools = list(set(all_pos_pools))
         all_neg_pools = list(set(all_neg_pools) - set(all_pos_pools))
 
-        # 选择样本
-        pos_clip_indices = random.sample(all_pos_pools, k=min(max_n, len(all_pos_pools))) if all_pos_pools else []
-        neg_clip_indices = random.sample(all_neg_pools, k=min(max_n, len(all_neg_pools))) if all_neg_pools else []
+        pos_clip_indices = []
+        neg_clip_indices = []
+        if all_pos_pools and all_neg_pools:
+            # 选择样本
+            pos_clip_indices = random.sample(all_pos_pools, k=min(max_n, len(all_pos_pools))) if all_pos_pools else []
+            neg_clip_indices = random.sample(all_neg_pools, k=min(max_n, len(all_neg_pools))) if all_neg_pools else []
 
         # 填充到固定长度
         pos_clip_indices.extend([-1] * (max_n - len(pos_clip_indices)))
@@ -620,8 +607,7 @@ class StartEndDataset(Dataset):
         all_neg_indices = []
         
         # 生成分数数组
-        score_array = np.zeros(ed - st)
-        
+        score_array = gt_scores[st:ed]     
         try:
             for gt_window in gt_windows:
                 gt_st, gt_ed = map(int, gt_window)
@@ -634,14 +620,9 @@ class StartEndDataset(Dataset):
                     # 确保索引范围有效
                     src_start = max(0, intersect_st - gt_st)
                     src_end = min(len(gt_scores), intersect_ed - gt_st)
-                    dst_start = max(0, intersect_st - st)
-                    dst_end = min(len(score_array), intersect_ed - st)
                     
                     length = src_end - src_start
-                    if length > 0:
-                        score_array[dst_start:dst_start + length] = \
-                            gt_scores[src_start:src_start + length]
-                        
+                    if length > 0:             
                         # 收集正样本及其分数
                         curr_scores = gt_scores[src_start:src_start + length]
                         curr_indices = list(range(intersect_st, intersect_st + length))
@@ -675,6 +656,11 @@ class StartEndDataset(Dataset):
         # 填充到固定长度
         pos_clip_indices.extend([-1] * (max_n - len(pos_clip_indices)))
         neg_clip_indices.extend([-1] * (max_n - len(neg_clip_indices)))
+
+        # print("start from: ",st)
+        # print("generated score_array: ", score_array)
+        # print("true score_array: ", gt_scores)
+        # input("press enter to continue, or ctrl-c to exit")
         
         return pos_clip_indices, neg_clip_indices, score_array
 
@@ -700,17 +686,12 @@ class StartEndDataset(Dataset):
         return torch.from_numpy(q_feat)  # (D, ) or (Lq, D)
 
     def _get_video_feat_by_vid(self, vid):
-
-        # print("in func _get_query_feat_by_qid(): ")
-
         v_feat_list = []
         for _feat_dir in self.v_feat_dirs:
             _feat_path = join(_feat_dir, f"{vid}.npz")
             _feat = np.load(_feat_path)["features"][:self.max_v_l].astype(np.float32)
             _feat = l2_normalize_np_array(_feat)
             v_feat_list.append(_feat)
-            # print("feat type: ",_feat_dir)
-            # print("len: ",len(_feat))
         
         # some features are slightly longer than the others
         # 对齐所有特征的长度（采用多特征的时候）
@@ -718,39 +699,7 @@ class StartEndDataset(Dataset):
         v_feat_list = [e[:min_len] for e in v_feat_list]
         v_feat = np.concatenate(v_feat_list, axis=1)
 
-        # print("min_len: ",min_len)
-        # print("output_len: ",len(torch.from_numpy(v_feat)))
-
-
         return torch.from_numpy(v_feat)  # (Lv, D)
-    
-    def _get_audio_feat_by_vid(self, vid):
-        a_feat_list = []
-        for _feat_dir in self.a_feat_dirs:
-            if self.dset_name == 'qvhighlight' or self.dset_name == 'qvhighlight_pretrain':
-                if self.a_feat_types == "pann":
-                    _feat_path = join(_feat_dir, f"{vid}.npy")
-                    _feat = np.load(_feat_path)[:self.max_a_l].astype(np.float32)
-                else:
-                    raise NotImplementedError
-                _feat = l2_normalize_np_array(_feat) # normalize?
-                a_feat_list.append(_feat)
-            elif self.dset_name in ['clotho-moment', 'unav100-subset', 'tut2017']:
-                if self.a_feat_types == "clap":
-                    _feat_path = join(_feat_dir, f"{vid}.npz")
-                    _feat = np.load(_feat_path)["features"][:self.max_a_l].astype(np.float32)
-                else:
-                    raise NotImplementedError
-                _feat = l2_normalize_np_array(_feat) # normalize?
-                a_feat_list.append(_feat)
-            else:
-                raise NotImplementedError
-        
-        # some features are slightly longer than the others
-        min_len = min([len(e) for e in a_feat_list])
-        a_feat_list = [e[:min_len] for e in a_feat_list]
-        a_feat = np.concatenate(a_feat_list, axis=1)
-        return torch.from_numpy(a_feat)  # (Lv, D)
 
 def start_end_collate_ol(batch):
     """处理batch数据，过滤掉无效样本"""
@@ -760,7 +709,6 @@ def start_end_collate_ol(batch):
         print("batch is empty")
         return None
 
-    
     # 分离meta和model_inputs
     metas, model_inputs_list = [], []
     for b in batch:
@@ -865,20 +813,6 @@ def prepare_batch_inputs(metas, batched_model_inputs, device, non_blocking=False
             src_vid = torch.cat(video_feats, dim=1)
         else:
             src_vid = batched_model_inputs['video_feat_short']
-    
-    # 2. 处理音频特征（如果有）
-    if 'audio_feat_short' in batched_model_inputs:
-        if 'audio_feat_long' in batched_model_inputs:
-            audio_feats = [
-                batched_model_inputs['audio_feat_long'],
-                batched_model_inputs['audio_feat_short']
-            ]
-            if 'audio_feat_future' in batched_model_inputs:
-                audio_feats.append(batched_model_inputs['audio_feat_future'])
-            src_aud = torch.cat(audio_feats, dim=1)
-        else:
-            src_aud = batched_model_inputs['audio_feat_short']
-        model_inputs['src_aud'] = src_aud.to(device, non_blocking=non_blocking)
     
     # 3. 基本输入处理
     model_inputs.update({
