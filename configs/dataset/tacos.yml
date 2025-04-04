@@ -4,7 +4,7 @@ clip_length: 2
 # eval_path: /home/gfj/lighthouse-main/data/tacos/tacos_test_release.jsonl
 train_path: /home/gfj/lighthouse-main/data/tacos/tacos_new_train_release.jsonl
 eval_path: /home/gfj/lighthouse-main/data/tacos/tacos_new_test_release.jsonl
-max_v_l: 1000
+max_v_l: -1
 max_q_l: 100
 eval_bsz: 32
 

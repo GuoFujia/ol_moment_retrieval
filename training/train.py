@@ -168,12 +168,11 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i):
 def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset, opt):
     opt.train_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Loss] {loss_str}\n"
     opt.eval_log_txt_formatter = "{time_str} [Epoch] {epoch:03d} [Loss] {loss_str} [Metrics] {eval_metrics_str}\n"
-    collate_fn = start_end_collate_ol  
     save_submission_filename = "latest_{}_val_preds.jsonl".format(opt.dset_name)
 
     train_loader = DataLoader(
         train_dataset,
-        collate_fn=collate_fn,
+        collate_fn=lambda batch: start_end_collate_ol(batch, long_memory_sample_length=train_dataset.long_memory_sample_length),
         batch_size=opt.bsz,
         num_workers=opt.num_workers,
         shuffle=True,
@@ -182,6 +181,10 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
     if opt.model_ema:
         logger.info("Using model EMA...")
         model_ema = ModelEMA(model, decay=opt.ema_decay)
+
+    # # train的时候，加载所有mid的标签，并set进模型中
+    # mid_label_dict = train_dataset.load_all_mid_label_dict()
+    # model.set_mid_label_dict(mid_label_dict)
 
     prev_best_score = 0
     for epoch_i in trange(opt.n_epoch, desc="Epoch"):

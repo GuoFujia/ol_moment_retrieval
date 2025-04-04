@@ -56,8 +56,8 @@ def check_dataloader(dataset, batch_size=4):
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
-        collate_fn=start_end_collate_ol,
-        shuffle=True,
+        collate_fn=lambda batch: start_end_collate_ol(batch, long_memory_sample_length=dataset.long_memory_sample_length),
+        shuffle=False,
         num_workers=0
     )
     
@@ -159,13 +159,13 @@ if __name__ == "__main__":
         dset_name="activitynet",
         # data_path="/home/gfj/lighthouse-main/data/qvhighlight/highlight_val_release.jsonl",
         # data_path="/home/gfj/lighthouse-main/data/tacos/tacos_val_release.jsonl",
-        data_path="/home/gfj/lighthouse-main/data/activitynet/activitynet_val_release.jsonl",
+        data_path="/home/gfj/lighthouse-main/data/activitynet/activitynet_train_release.jsonl",
         v_feat_dirs=v_feat_dirs,
         q_feat_dir=t_feat_dir,
         short_memory_sample_length=8,
         long_memory_sample_length=64,
         future_memory_sample_length=0,
-        test_mode=False,
+        test_mode=True,
         domain=None, 
         a_feat_dirs=None,
     )

@@ -1,13 +1,16 @@
+import math
+from multiprocessing import process
+
 import numpy as np
 import torch
-import torch.nn.functional as F
 from torch import nn
+import torch.nn.functional as F
 
-from lighthouse.common.utils.span_utils import generalized_temporal_iou, span_cxw_to_xx
-from lighthouse.common.position_encoding import build_position_encoding
 from lighthouse.common.matcher import build_matcher
 from lighthouse.common.misc import accuracy
 from lighthouse.common.moment_transformer import build_transformer
+from lighthouse.common.position_encoding import build_position_encoding
+from lighthouse.common.utils.span_utils import temporal_iou, generalized_temporal_iou, span_cxw_to_xx
 
 
 class VideoMemoryCompressor(nn.Module):
@@ -117,6 +120,212 @@ class VideoMemoryCompressor(nn.Module):
         
         return Fv_compress, compress_mask
 
+class VideoMemoryCompressorWithExternalWeights(nn.Module):
+    """
+    基于注意力机制的视频记忆压缩模块，支持融合外部权重
+    
+    输入:
+        Fv: 长期视频记忆特征，形状为 (batch_size, vid_len, dimension)
+        mask: 指示有效位置的掩码，形状为 (batch_size, vid_len)。这个掩码同时应用于Fv和extern_weight
+        extern_weight: 外部提供的权重，形状为 (batch_size, vid_len)
+        
+    输出:
+        Fv_compress: 压缩后的视频特征，形状为 (batch_size, compress_len, dimension)
+        combined_weights: 注意力权重与外部权重的平均，形状为 (batch_size, compress_len, vid_len)
+    """
+
+    def __init__(self, dimension, compress_len, num_heads=8, dropout=0.1):
+        """
+        初始化压缩模块
+        
+        参数:
+            dimension: 特征维度
+            compress_len: 压缩后的视频长度
+            num_heads: 多头注意力的头数
+            dropout: Dropout率
+        """
+        super(VideoMemoryCompressorWithExternalWeights, self).__init__()
+
+        self.dimension = dimension
+        self.compress_len = compress_len
+        self.num_heads = num_heads
+        
+        # 确保dimension可以被num_heads整除
+        assert dimension % num_heads == 0, "维度必须能被头数整除"
+
+        # 可学习的查询参数，将作为cross-attention中的query
+        # 形状: (1, compress_len, dimension)
+        self.query = nn.Parameter(torch.randn(1, compress_len, dimension))
+        
+        # 初始化查询参数
+        nn.init.xavier_uniform_(self.query)
+        
+        # 多头注意力层 - 不直接使用nn.MultiheadAttention，因为需要获取并修改注意力权重
+        # 因此需要自己实现多头注意力机制的核心部分
+
+        # 为query, key, value创建线性变换
+        self.q_proj = nn.Linear(dimension, dimension)
+        self.k_proj = nn.Linear(dimension, dimension)
+        self.v_proj = nn.Linear(dimension, dimension)
+        
+        # 输出投影
+        self.out_proj = nn.Linear(dimension, dimension)
+        
+        # Dropout
+        self.attn_dropout = nn.Dropout(dropout)
+        
+        # 层归一化和残差连接
+        self.norm = nn.LayerNorm(dimension)
+        
+        # 前馈网络
+        self.feed_forward = nn.Sequential(
+            nn.Linear(dimension, 4 * dimension),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * dimension, dimension),
+            nn.Dropout(dropout)
+        )
+        
+        # 最终的层归一化
+        self.final_norm = nn.LayerNorm(dimension)
+
+    def forward(self, Fv, extern_weight=None, mask=None, weight_alpha=0.5):
+        """
+        前向传播
+        
+        参数:
+            Fv: 长期视频记忆特征，形状为 (batch_size, vid_len, dimension)
+            extern_weight: 外部提供的权重，形状为 (batch_size, vid_len)
+            mask: 有效位置的掩码，形状为 (batch_size, vid_len)，True表示有效位置
+            weight_alpha: 注意力权重的权重，1-weight_alpha为外部权重的权重
+            
+        返回:
+            Fv_compress: 压缩后的视频特征，形状为 (batch_size, compress_len, dimension)
+            combined_weights: 注意力权重与外部权重的平均，形状为 (batch_size, compress_len, vid_len)
+        """
+        
+        batch_size, vid_len, _ = Fv.size()
+        
+        # 扩展查询以匹配批次大小
+        # 从 (1, compress_len, dimension) 到 (batch_size, compress_len, dimension)
+        query = self.query.expand(batch_size, -1, -1)
+
+        # 1. 投影query, key, value
+        q = self.q_proj(query)  # (batch_size, compress_len, dimension)
+        k = self.k_proj(Fv)     # (batch_size, vid_len, dimension)
+        v = self.v_proj(Fv)     # (batch_size, vid_len, dimension)
+        
+        # 2. 分割多头
+        head_dim = self.dimension // self.num_heads
+        
+        # 重塑为多头格式
+        # (batch_size, seq_len, dimension) -> (batch_size, seq_len, num_heads, head_dim)
+        q = q.view(batch_size, -1, self.num_heads, head_dim)
+        k = k.view(batch_size, -1, self.num_heads, head_dim)
+        v = v.view(batch_size, -1, self.num_heads, head_dim)
+        
+        # 交换维度以便于计算
+        # (batch_size, seq_len, num_heads, head_dim) -> (batch_size, num_heads, seq_len, head_dim)
+        q = q.transpose(1, 2)  # (batch_size, num_heads, compress_len, head_dim)
+        k = k.transpose(1, 2)  # (batch_size, num_heads, vid_len, head_dim)
+        v = v.transpose(1, 2)  # (batch_size, num_heads, vid_len, head_dim)
+        
+        # 3. 计算注意力分数
+        # (batch_size, num_heads, compress_len, head_dim) @ (batch_size, num_heads, head_dim, vid_len)
+        # -> (batch_size, num_heads, compress_len, vid_len)
+        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(head_dim)
+        
+        # 应用掩码（如果提供）
+        if mask is not None:
+            # 扩展掩码以适应多头注意力的形状
+            # (batch_size, vid_len) -> (batch_size, 1, 1, vid_len)
+            expanded_mask = mask.unsqueeze(1).unsqueeze(2)
+            
+            # 在不有效的位置应用大的负值
+            scores = scores.masked_fill(~expanded_mask.bool(), -1e9)
+        
+        # 应用softmax得到注意力权重
+        attn_weights = F.softmax(scores, dim=-1)  # (batch_size, num_heads, compress_len, vid_len)
+        attn_weights = self.attn_dropout(attn_weights)
+        
+        # 4. 如果提供了外部权重，将其与注意力权重融合
+        combined_weights = None
+        if extern_weight is not None:
+            # 确保extern_weight的形状正确
+            assert extern_weight.shape == (batch_size, vid_len), \
+                f"外部权重形状应为 {(batch_size, vid_len)}, 但得到了 {extern_weight.shape}"
+            
+            # 首先将extern_weight形状由(batch_size, vid_len)变为(batch_size, compress_len, vid_len)
+            # 扩展后的维度1应该为compress_len，每个维度2的值相同
+            extern_weight = extern_weight.unsqueeze(1).expand(-1, self.compress_len, -1)
+
+            # 首先处理外部权重的掩码，同样使用传入的mask
+            # 注意：mask应该已经包含了对vid_len维度的掩码
+            masked_extern_weight = extern_weight.clone()
+
+            if mask is not None:
+                # 将mask应用于extern_weight的vid_len维度
+                # mask: (batch_size, vid_len)
+                # extern_weight: (batch_size, compress_len, vid_len)
+                mask_expanded = mask.unsqueeze(1)  # (batch_size, 1, vid_len)
+
+                masked_extern_weight = masked_extern_weight.masked_fill(~mask_expanded.bool(), 0)
+                
+                # 重新归一化外部权重，使每行的和为1
+                # 注意：对于全为0的行（即所有位置都被掩码的情况），我们添加一个小的epsilon以避免除以0
+                row_sums = masked_extern_weight.sum(dim=-1, keepdim=True)
+                masked_extern_weight = masked_extern_weight / (row_sums + 1e-9)
+
+            # 扩展外部权重以匹配多头注意力的形状
+            # (batch_size, compress_len, vid_len) -> (batch_size, 1, compress_len, vid_len)
+            extern_weight_expanded = masked_extern_weight.unsqueeze(1)
+
+            # 融合两种权重
+            combined_weights = weight_alpha * attn_weights + (1 - weight_alpha) * extern_weight_expanded
+            
+            # 确保权重总和为1
+            # 由于已经对两个输入分别进行了softmax/归一化，并且是线性组合，
+            # 所以combined_weights的每一行的和应该接近1，但为了确保精确性，我们再次归一化
+            combined_weights_sum = combined_weights.sum(dim=-1, keepdim=True)
+            combined_weights = combined_weights / (combined_weights_sum + 1e-9)
+            
+            # 使用融合后的权重计算加权和
+            # (batch_size, num_heads, compress_len, vid_len) @ (batch_size, num_heads, vid_len, head_dim)
+            # -> (batch_size, num_heads, compress_len, head_dim)
+            weighted_v = torch.matmul(combined_weights, v)
+        else:
+            # 如果没有外部权重，就使用原始注意力权重
+            weighted_v = torch.matmul(attn_weights, v)
+            combined_weights = attn_weights
+
+        # 5. 合并多头结果
+        # (batch_size, num_heads, compress_len, head_dim) -> (batch_size, compress_len, num_heads, head_dim)
+        weighted_v = weighted_v.transpose(1, 2).contiguous()
+        
+        # (batch_size, compress_len, num_heads, head_dim) -> (batch_size, compress_len, dimension)
+        weighted_v = weighted_v.view(batch_size, self.compress_len, self.dimension)
+
+        # 6. 应用输出投影
+        attn_output = self.out_proj(weighted_v)
+        
+        # 7. 残差连接和层归一化
+        attn_output = self.norm(query + attn_output)
+        
+        # 8. 前馈网络
+        ff_output = self.feed_forward(attn_output)
+        
+        # 9. 残差连接和最终层归一化
+        Fv_compress = self.final_norm(attn_output + ff_output)
+
+        # 10. 将多头注意力权重平均为单头形式以便返回
+        # (batch_size, num_heads, compress_len, vid_len) -> (batch_size, compress_len, vid_len)
+        combined_weights_single = combined_weights.mean(dim=1)
+
+        # 创建压缩后的掩码，形状为 (batch_size, compress_len)，全为True
+        compress_mask = torch.ones((batch_size, self.compress_len), dtype=torch.bool, device=Fv.device)
+        
+        return Fv_compress, compress_mask, combined_weights_single
+
 class OLMomentDETR(nn.Module):
     """ This is the Moment-DETR module that performs moment localization. """
 
@@ -153,6 +362,12 @@ class OLMomentDETR(nn.Module):
         self.saliency_proj = nn.Linear(hidden_dim, 1)
         self.compress_len = compress_len
 
+        # 一个字典，记录每个[qid_vid]对对应的视频的mid_label标签值
+        # 用mid_label_dict[qid_vid]可以快速访问
+        # mid_label_dict结构：每个[qid_vid]索引两个元素：1.start：当前vid对于qid从start·开始采样；
+        #                                              2.score：二维float数组，score[i][j]代表从start开始的第i帧的第j个预测mid_label
+        self.mid_label_dict = {}
+
         self.use_txt_pos = use_txt_pos
         self.n_input_proj = n_input_proj
         # self.foreground_thd = foreground_thd
@@ -160,7 +375,8 @@ class OLMomentDETR(nn.Module):
 
         self.use_vid_compression = use_vid_compression
         if self.use_vid_compression:
-            self.memory_compressor = VideoMemoryCompressor(hidden_dim, compress_len=compress_len)
+            # self.memory_compressor = VideoMemoryCompressor(hidden_dim, compress_len=compress_len)
+            self.memory_compressor = VideoMemoryCompressorWithExternalWeights(hidden_dim, compress_len=compress_len)
 
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         relu_args = [True] * 3
@@ -178,15 +394,22 @@ class OLMomentDETR(nn.Module):
 
         self.aux_loss = aux_loss
 
-    def forward(self, src_txt, src_txt_mask, src_vid, memory_len, src_vid_mask, chunk_idx, src_aud=None, src_aud_mask=None):
+    # def set_mid_label_dict(self, mid_label_dict):
+    #     self.mid_label_dict = mid_label_dict
+    #     print("Mid label dict set in model, len of mid_label_dict: {}".format(len(mid_label_dict)))
+
+    def forward(self, src_txt, src_txt_mask, src_vid, memory_len, src_vid_mask, chunk_idx, src_aud=None, src_aud_mask=None,
+                long_memory_weight=None, qid_vid=None, short_memory_start=None):
         """
         在线模型forward需要的输入:
                 -src_txt: [batch_size, L_txt, D_txt]
                 -src_txt_mask: [batch_size, L_txt],
                 -src_vid: [batch_size, L_vid, D_vid], 
-                    L_vid = long_mempry_sample_length + short_mempry_sample_length + future_mempry_sample_length
+                    L_vid = long_memory_sample_length + short_memory_sample_length + future_memory_sample_length
                 - src_vid_mask: [batch_size, L_vid]
                 -memory_len: [], 三种记忆的采样长度
+                -long_memory_weight: [batch_size, L_vid],在train的时候使用,用于提供extern_weight
+                -qid_vid: [batch_size,],在eval/val的时候使用的，用于将样本和mid_label_dict中的标签匹配
         返回值为包含以下内容的dict:
                 -"pred_spans": The normalized boxes coordinates for all queries, represented as
                                (center_x, width). These values are normalized in [0, 1],
@@ -199,6 +422,27 @@ class OLMomentDETR(nn.Module):
 
         """
 
+        # if qid_vid is not None:
+        #     # 捕获6083，"tsOkWgzgW-o_60.0_210.0"
+        #     for i in range(len(qid_vid)):
+        #         if qid_vid[i][0] == 6083:
+        #             print("catch 6083")
+        #             print("src_txt:", src_txt[i])
+        #             print("src_txt_mask:", src_txt_mask[i])
+        #             print("src_vid:", src_vid[i])
+        #             print("src_vid_mask:", src_vid_mask[i])
+        #             print("memory_len:", memory_len)
+        #             print("chunk_idx:", chunk_idx[i])
+        #             if  long_memory_weight is not None:
+        #                 print("long_memory_weight:", long_memory_weight[i])
+        #             if qid_vid is not None:
+        #                 print("qid_vid:", qid_vid[i])
+        #             print("short_memory_start:", short_memory_start[i])
+        #             input("Press Enter to continue...")
+        #     input("捕获6083结束")
+            
+
+
         #   拼接音频特征
         if src_aud is not None:
             src_vid = torch.cat([src_vid, src_aud], dim=2)
@@ -209,9 +453,39 @@ class OLMomentDETR(nn.Module):
         # 取长期记忆视频，长期记忆mask
         long_vid = src_vid[:, :memory_len[0]]
         long_vid_mask = src_vid_mask[:, :memory_len[0]]
+
         # 压缩长期记忆
         if self.use_vid_compression:
-            compress_long_vid, compress_long_mask = self.memory_compressor(long_vid, long_vid_mask)
+            # 如果是train，使用数据集提供的mid分数作为extern_weight
+            if self.training:
+                extern_weight = long_memory_weight
+            else: # inference时，使用过去推理的mid结果
+                all_weights = []
+                extern_weight = None  # 显式初始化
+
+                for batch_idx in range(len(qid_vid)):
+                    output = self.get_long_memory_weight_by_qid_vid(qid_vid[batch_idx][0], qid_vid[batch_idx][1])
+                    
+                    if output is None:
+                        # print(f"No long memory weight found for qid {qid_vid[batch_idx][0]} and vid {qid_vid[batch_idx][1]}")
+                        # 清空已收集的权重，确保一致性
+                        all_weights = []  
+                        extern_weight = None
+                        break
+                    indexed_weight = self.index_weight(output[1], output[0], short_memory_start[batch_idx], memory_len[0])
+                    all_weights.append(torch.from_numpy(indexed_weight).float())
+
+                # 只有在所有batch都成功获取权重时才stack
+                if len(all_weights) == len(qid_vid):
+                    extern_weight = torch.stack(all_weights, dim=0)
+                else:
+                    extern_weight = None
+                    
+            # 确保extern_weight在和long_vid在相同的设备上
+            if extern_weight is not None:
+                extern_weight = extern_weight.to(long_vid.device)
+            
+            compress_long_vid, compress_long_mask, combined_weights_single = self.memory_compressor(long_vid, mask=long_vid_mask, extern_weight=extern_weight)
             #   将压缩后的长期记忆和短期，future记忆拼接得到新的src_vid, src_vid_mask
             src_vid, src_vid_mask = torch.cat([compress_long_vid, src_vid[:, memory_len[0]:]], dim=1), \
                 torch.cat([compress_long_mask, src_vid_mask[:, memory_len[0]:]], dim=1)
@@ -257,11 +531,6 @@ class OLMomentDETR(nn.Module):
         out['frame_pred'] = self.frame_class_embed(vid_mem)[:, short_start:short_end]    # (bsz, short_memory_length, 4)
         out["saliency_scores"] = self.saliency_proj(vid_mem).squeeze(-1)[:, short_start:short_end]  # (bsz, short_memory_length)
 
-        # # 如果是测试阶段，只取最后一个帧的预测,并保持形状
-        # if not self.training:
-        #     out["frame_pred"] = out["frame_pred"][:, -1, :].unsqueeze(1)            # (bsz, 1, 4)
-        #     out["saliency_scores"] = out["saliency_scores"][:,-1].unsqueeze(1)      # (bsz, 1)
-
         if self.aux_loss:
             # assert proj_queries and proj_txt_mem
             out['aux_outputs'] = [
@@ -270,8 +539,96 @@ class OLMomentDETR(nn.Module):
         # 添加 chunk_idx 到输出
         out["chunk_idx"] = chunk_idx  # [batch_size]
 
+        # 维护和更新mid_label_dict的逻辑
+        if self.use_vid_compression and not self.training and qid_vid is not None and short_memory_start is not None:
+            # 确保qid_vid和short_memory_start是CPU上的标量
+            qid_vid_list = qid_vid # 转换为Python列表
+            short_memory_start_list = short_memory_start
+            batch_size = src_vid.shape[0]
+
+            for i in range(batch_size):
+                qid,vid = qid_vid_list[i]
+                current_short_start = short_memory_start_list[i]
+                current_frame_pred = out['frame_pred'][i, :, 1]  # 提取mid标签logits
+                # 将预测结果转化为概率值
+                current_frame_pred = torch.sigmoid(current_frame_pred)
+                current_length = current_frame_pred.size(0)
+                current_frame_pred_np = current_frame_pred.cpu().detach().numpy()
+
+                if (qid,vid) not in self.mid_label_dict:
+                    # 初始化新条目
+                    weight = np.full((current_length, memory_len[1]), np.nan)
+                    # 将当前预测结果填充到weight中
+                    weight[:current_length, 0] = current_frame_pred_np
+                    self.mid_label_dict[(qid,vid)] = {
+                        'start': current_short_start,
+                        'weight': weight
+                    }
+                else:
+                    entry = self.mid_label_dict[(qid,vid)]
+                    existing_start = entry['start']
+                    existing_weight = entry['weight']
+                    new_L = current_short_start - existing_start + current_length
+                    new_weight = np.full((new_L, memory_len[1]), np.nan)
+                    # 将existing_weight复制到new_weight
+                    new_weight[:existing_weight.shape[0], :memory_len[1]] = existing_weight
+                    # 将现有数据复制到新数组
+                    for i, mid_label in enumerate(current_frame_pred_np):
+                        for insert_idx, latest_label in enumerate(new_weight[current_short_start + i - existing_start]):
+                            if np.isnan(latest_label) :
+                                new_weight[current_short_start + i - existing_start, insert_idx] = mid_label
+                                break
+                    # 更新条目
+                    entry['weight'] = new_weight
         return out
 
+    def reset_mid_label_dict(self):
+        self.mid_label_dict = {}
+
+    def process_probs_by_avg(self,probs):
+        return np.mean(probs, axis=0)
+
+    # 通过mid_label_dict获取long memory的weight
+    # 返回值:1.startl2.从start开始的全部的long_memory_weight,形状为(batch_size, long_memory_length)
+    def get_long_memory_weight_by_qid_vid(self,qid,vid):
+        if (qid,vid) not in self.mid_label_dict:
+            return None
+        dict = self.mid_label_dict[(qid,vid)]
+        dict_weight = dict["weight"]
+        res = []
+        for frame in dict_weight:
+            # 对于frame中的prob，先筛除nan
+
+            # print(frame.dtype)  # 如果 frame 是 NumPy 数组
+            # print([type(x) for x in frame])  # 如果 frame 是 Python 列表
+            # print("frame:", frame)
+            # print("dict_weight:", dict_weight)
+            # print("dict_start:", dict_start)
+            # print("dict:", self.mid_label_dict[(qid,vid)])
+            # input("press enter to continue...")
+
+            valid_frame = frame[~np.isnan(frame)]
+            frame_weight = self.process_probs_by_avg(valid_frame)
+            res.append(frame_weight)
+        return dict["start"], np.array(res)
+    # 从get_long_memory_weight_by_qid_vid返回的weight_list中获取[st,ed]之间的分数
+    # 返回的结果应该是pad到return_len的长度
+    def index_weight(self,weight_list,weight_start,short_start,return_len):
+        # 从weight_list中，取出[weight_start,short_start]之间的分数（不包括short_start对应的帧）作为raw_res
+        # 如果raw_res比return_len小，有效值在低位索引处，用0填充
+        # 如果raw_res比return_len大，则从后向前阶段，确保返回值长度
+        weight_list = np.pad(weight_list, (weight_start, 0), 'constant', constant_values=0)
+        if weight_start > short_start:
+            return None
+        raw_res = weight_list[:short_start]
+        if len(weight_list)<short_start:
+            raw_res = np.pad(weight_list, (0, short_start - len(weight_list)), 'constant', constant_values=0)
+        if len(raw_res) < return_len:
+            raw_res = np.pad(raw_res, (0, return_len - len(raw_res)), 'constant', constant_values=0)
+        else:
+            raw_res = raw_res[-return_len:]
+        return raw_res
+        
 class SetCriterionOl(nn.Module):
     """ This class computes the loss for ol_DETR.
     主要计算两部分的loss:
@@ -294,6 +651,7 @@ class SetCriterionOl(nn.Module):
         self.saliency_margin = saliency_margin
         self.gamma = gamma  # 添加 gamma 作为初始化参数
 
+    # 根据frame_pred结果做的span loss
     def loss_spans(self, outputs, targets):
         frame_pred = outputs['frame_pred']  # (batch_size, short_memory_len, 4)
         chunk_idx = outputs.get('chunk_idx', None)
@@ -361,6 +719,67 @@ class SetCriterionOl(nn.Module):
         
         return {
             'loss_spans_v1': loss_v1
+        }
+
+    def new_loss_spans(self, outputs, targets):
+        pred_spans = outputs['pred_spans']  # (batch_size, num_queries, 2)
+        chunk_idx = outputs.get('chunk_idx', None)
+
+        if chunk_idx is None:
+            raise ValueError("chunk_idx is missing in outputs")
+
+        device = pred_spans.device
+        batch_size = pred_spans.shape[0]
+        num_queries = pred_spans.shape[1]
+
+        # 初始化损失
+        loss_span = torch.tensor(0.0, device=device, requires_grad=True)
+        loss_giou = torch.tensor(0.0, device=device, requires_grad=True)
+        valid_samples = 0
+
+        # 遍历每个样本
+        for i, idx in enumerate(chunk_idx):
+            # 找到 targets 中对应的样本
+            target_meta = next((meta for meta in targets['meta'] if meta['chunk_idx'] == idx.item()), None)
+            if target_meta is None:
+                continue
+
+            # 获取真实的时间片段 (center_x, width)
+            gt_spans = target_meta['gt_windows']  # list of [st, ed]
+            if not gt_spans:
+                continue  # 如果没有真实片段，跳过
+
+            # 将真实片段转换为张量
+            gt_spans = torch.tensor(gt_spans, dtype=torch.float32, device=device)  # (num_gt_spans, 2)
+
+            # 当前样本的预测片段
+            sample_pred_spans = pred_spans[i]  # (num_queries, 2)
+            short_start = targets['short_memory_start']["spans"]
+            sample_pred_spans = span_cxw_to_xx(sample_pred_spans)
+            sample_pred_spans = sample_pred_spans * target_meta["start_label"].shape[0]
+            sample_pred_spans = sample_pred_spans + torch.tensor(short_start[i], dtype=torch.float32, device=device)
+
+            # 计算所有预测和真实片段对的L1距离
+            l1_dist = torch.cdist(sample_pred_spans, gt_spans, p=1)  # (num_queries, num_gt_spans)
+            min_l1_loss = l1_dist.min(dim=1)[0].mean()  # 每个查询到最近真实片段的最小L1距离
+
+            # 计算广义IoU
+            giou_matrix = 1 - generalized_temporal_iou(sample_pred_spans, gt_spans)  # (num_queries, num_gt_spans)
+            max_giou_per_query = giou_matrix.max(dim=1)[0]  # 每个查询的最大GIoU
+            mean_max_giou = max_giou_per_query.mean()  # 所有查询的平均最大GIoU
+
+            # 累加损失
+            loss_span = loss_span + min_l1_loss
+            loss_giou = loss_giou + mean_max_giou
+            valid_samples += 1
+
+        if valid_samples > 0:
+            loss_span = loss_span / valid_samples
+            loss_giou = loss_giou / valid_samples
+
+        return {
+            'loss_span': loss_span,
+            'loss_giou': loss_giou
         }
 
     def loss_labels(self, outputs, targets, log=True):
@@ -444,11 +863,19 @@ class SetCriterionOl(nn.Module):
 
             # 将 logits 转换为概率值
             pred_probs = torch.sigmoid(pred_slice)  # (num_valid_samples, num_frames)
-
-            # 计算加权BCE损失
-            loss = F.binary_cross_entropy(
-                pred_probs, target, reduction='none'
-            )
+            try:
+                # 计算加权BCE损失
+                loss = F.binary_cross_entropy(
+                    pred_probs.to(torch.float64), target, reduction='none'
+                )
+            except Exception as e:
+                print("pred_probs: ", pred_probs)
+                print("target: ", target)
+                print("pred_probs.shape: ", pred_probs.shape)
+                print("target.shape: ", target.shape)
+                input("Press Enter to continue...")
+                print(f"Error in {label_type} loss calculation: {e}")
+                input("Press Enter to continue...")
 
             # # 计算加权BCE损失
             # loss = F.binary_cross_entropy_with_logits(
@@ -634,10 +1061,6 @@ class LinearLayer(nn.Module):
         if self.relu:
             x = F.relu(x, inplace=True)
         return x  # (N, L, D)
-
-
-
-
 
 def build_model(args):
     # the `num_classes` naming here is somewhat misleading.

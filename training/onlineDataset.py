@@ -3,6 +3,7 @@ import sys
 import torch
 from torch.utils.data import Dataset
 import numpy as np
+from torchtext.models.t5 import model
 from tqdm import tqdm
 import random
 import logging
@@ -33,7 +34,8 @@ class StartEndDataset(Dataset):
                  max_windows=5, span_loss_type="l1", load_labels=True,
                  chunk_interval=1, short_memory_stride=1, long_memory_stride=1,
                  future_memory_stride=1, load_future_memory=False,test_mode=False,
-                 use_gaussian_labels=True, alpha_s=0.25, alpha_m=0.21, alpha_e=0.25,
+                 use_gaussian_labels=True, asym_gaussian_label=False,
+                 alpha_s=0.25, alpha_m=0.21, alpha_e=0.25,
                  pos_expansion_ratio=1., neg_pos_ratio=3,):
         self.fps = 0.5  #qv数据集定义的clip就是2s,把clip级特征看作帧级别特征用的话，就是0.5
                         #而其他数据集，follw lighthose的设置，也是2s一次采样，也可以看作0.5        
@@ -48,6 +50,13 @@ class StartEndDataset(Dataset):
         self.q_feat_type = q_feat_type
         self.v_feat_types = v_feat_types
         self.a_feat_types = a_feat_types
+
+        if max_v_l == -1:
+            max_v_l = 100000000
+        if max_a_l == -1:
+            max_a_l = 100000000
+        if max_q_l == -1:
+            max_q_l = 100
 
         self.max_q_l = max_q_l
         self.max_v_l = max_v_l
@@ -78,6 +87,7 @@ class StartEndDataset(Dataset):
         self.test_mode=test_mode
 
         self.use_gaussian_labels = use_gaussian_labels
+        self.asym_gaussian_label = asym_gaussian_label
         self.alpha_s = alpha_s
         self.alpha_m = alpha_m
         self.alpha_e = alpha_e
@@ -93,11 +103,56 @@ class StartEndDataset(Dataset):
         
         # data
         self.data = self.load_data()
-        # self.data = self.data[:len(self.data)//16]
+        # sample_size = len(self.data) // 16
+        # self.data = random.sample(self.data, sample_size)  # 随机抽取
+        # self.data = self.data[:sample_size] # 只取前sample_size个
         self.load_saliency_scores() 
+
+        # if ("tsOkWgzgW-o_60.0_210.0", 9539) in self.saliency_scores_list:
+        #     print("after load saliency scores for train: ", self.saliency_scores_list[("tsOkWgzgW-o_60.0_210.0", 9539)])
+        # if ("A_MFAuOwK5k_60.0_210.0", 6083) in self.saliency_scores_list:
+        #     print("after load saliency scores for test: ", self.saliency_scores_list[("A_MFAuOwK5k_60.0_210.0", 6083)])
+        # input("Press Enter to continue...")
+
+        # 高斯标签
+        self.st_label_dict, self.mid_label_dict, self.end_label_dict = self.load_all_gaussian_label_dict()
+        # if ("tsOkWgzgW-o_60.0_210.0", 9539) in self.st_label_dict:
+        #     print("after load gaussian labels for train, st is: ", self.st_label_dict[("tsOkWgzgW-o_60.0_210.0",9539)])
+        # if ("tsOkWgzgW-o_60.0_210.0", 9539) in self.mid_label_dict:
+        #     print("after load gaussian labels for train, mid is: ", self.mid_label_dict[("tsOkWgzgW-o_60.0_210.0",9539)])
+        # if ("tsOkWgzgW-o_60.0_210.0", 9539) in self.end_label_dict:
+        #     print("after load gaussian labels for train, end is: ", self.end_label_dict[("tsOkWgzgW-o_60.0_210.0",9539)])
+
+        # if ("A_MFAuOwK5k_60.0_210.0", 6083) in self.st_label_dict:
+        #     print("after load gaussian labels for test, st is: ", self.st_label_dict[("A_MFAuOwK5k_60.0_210.0",6083)])
+        # if ("A_MFAuOwK5k_60.0_210.0", 6083) in self.mid_label_dict:
+        #     print("after load gaussian labels for test, mid is: ", self.mid_label_dict[("A_MFAuOwK5k_60.0_210.0",6083)])
+        # if ("A_MFAuOwK5k_60.0_210.0", 6083) in self.end_label_dict:
+        #     print("after load gaussian labels for test, end is: ", self.end_label_dict[("A_MFAuOwK5k_60.0_210.0",6083)])
 
         # 分块信息
         self.chunk_infos = self.chunk_all_videos()[0]
+        # for chunk in self.chunk_infos:
+        #     if chunk['qid'] == 9539:
+        #         print(chunk)
+        #     if chunk['qid'] == 6083:
+        #         print(chunk)
+        # input("Press Enter to continue...")
+
+        # 创建(索引, short_memory_start, qid)的元组列表
+        indexed_data = [(i, item['short_memory_start'], item['qid']) for i, item in enumerate(self.chunk_infos)]
+        
+        # 按照short_memory_start和vid排序
+        sorted_indexed_data = sorted(indexed_data, key=lambda x: (x[1], x[2]))
+        
+        # 提取排序后的索引，这就是采样顺序
+        self.sample_seq = [item[0] for item in sorted_indexed_data]
+
+        # # 检查采样是否符合设想的顺序
+        # for idx in self.sample_seq:
+        #     print(indexed_data[idx]) # chunk_idx, short_memory_start, vid
+        # input("wait! check sample seq!\n")
+
         self.use_glove = 'glove' in q_feat_dir
         if self.use_glove:
             self.vocab = vocab.pretrained_aliases['glove.6B.300d']()
@@ -106,7 +161,50 @@ class StartEndDataset(Dataset):
             self.vocab.vectors = torch.cat(
                 (self.vocab.vectors, torch.zeros(1, self.vocab.dim)), dim=0)
             self.embedding = nn.Embedding.from_pretrained(self.vocab.vectors)
+
+
+
         
+    # train的时候，加载所有mid的标签，test的时候不能用这个
+    def load_all_gaussian_label_dict(self):
+        st_label_dict = {}
+        mid_label_dict = {}
+        end_label_dict = {}
+        if len(self.data) == 0:
+            print("No data is loaded, can't load gaussian labels")
+            return     
+        
+        for line in tqdm(self.data, desc="Loading gaussian labels"):
+            duration_frame = len(self._get_video_feat_by_vid(line["vid"]))
+            mid_scores = np.zeros(duration_frame, dtype=float)
+            # 利用generate_gaussian_labels，每个视频根据每个relevant_window生成高斯标签
+            # 然后取每个位置上的max值
+            all_mid_scores = []
+            all_st_scores = []
+            all_end_scores = []
+            for window in line["relevant_windows"]:
+                if self.dset_name == "qvhighlight" and "subs_train" not in self.data_path:
+                    start_frame = math.floor(window[0]*self.fps)
+                    end_frame = math.floor(window[1]*self.fps)
+                else:
+                    start_frame = math.floor(window[0]*self.fps)
+                    end_frame = math.ceil(window[1]*self.fps)
+                # generate_gaussian_labels
+                # gaussian_label = self.generate_gaussian_labels(duration_frame, start_frame, end_frame)
+                # TSGSV高斯生成代码中，ge_end是包含在gtnei的，所以这里要-1
+                gaussian_label = self.generate_gaussian_labels(duration_frame, start_frame, end_frame -1 ,self.short_memory_stride)
+
+                st_score, mid_scores, end_score = gaussian_label["start"], gaussian_label["middle"], gaussian_label["end"]
+
+                all_mid_scores.append(mid_scores)
+                all_st_scores.append(st_score)
+                all_end_scores.append(end_score)
+
+            mid_label_dict[(line["vid"], line["qid"])] = np.max(all_mid_scores, axis=0)
+            st_label_dict[(line["vid"], line["qid"])] = np.max(all_st_scores, axis=0)
+            end_label_dict[(line["vid"], line["qid"])] = np.max(all_end_scores, axis=0)
+        return st_label_dict, mid_label_dict, end_label_dict
+
     def load_saliency_scores(self):        
         if len(self.data) == 0:
             print("No data is loaded, can't load saliency scores")
@@ -319,58 +417,102 @@ class StartEndDataset(Dataset):
         print(f"Generated {len(valid_chunk_infos)} valid chunks out of {total_length} total chunks, line_cnt: {line_cnt}")
 
         return valid_chunk_infos, len(valid_chunk_infos)
-    def generate_gaussian_labels(self, video_length, start_idx, end_idx):
-        """生成非对称和截断高斯的标签（左闭右开区间 [start_idx, end_idx)）"""
-        # 单帧事件处理（start_idx == end_idx-1）
-        if start_idx == end_idx - 1:
-            min_sigma = 1.0
-            t = torch.arange(video_length, dtype=torch.float)
-            return {
-                'start': torch.exp(-((t - start_idx) ** 2) / (2 * min_sigma ** 2)),
-                'middle': torch.exp(-((t - (start_idx+0.5)) ** 2) / (2 * min_sigma ** 2)),  # 中点
-                'end': torch.exp(-((t - (end_idx-1)) ** 2) / (2 * min_sigma ** 2))
-            }
+    
+    def __gaussian_label__(self, t, mu, sigma, label_type):
+        if not self.asym_gaussian_label or label_type == 'semantic':
+            t = - np.power( (t - mu) / sigma, 2) / 2
+        else:
+            # ratio_ori = 0.2
+            # ratio_new = 0.6
+            ratio_ori = 0.1
+            ratio_new = 0.3
+            if label_type == 'start':
+                mask = (t < mu)
+                ratio_ori *= -1
+                ratio_new *= -1
+            else:
+                mask = (t > mu)
+            s_ori = ratio_ori * (mu - t) + sigma
+            s_new = ratio_new * (t - mu) + sigma
+            s = np.ma.array(s_ori, mask=mask)
+            s = s.filled(s_new)
+            t = - np.power((t - mu) / s, 2) / 2
+        return np.exp(t)
 
-        # 基础参数
-        t = torch.arange(video_length, dtype=torch.float)
-        duration = end_idx - start_idx  # 左闭右开区间的长度
-        middle_idx = start_idx + duration / 2  # 精确中点
-
-        # ---- 1. 设置扩展系数 ----
-        extension_ratio = 1.5
-
-        # ---- 2. 截断高斯语义标签 ----
-        sigma_m = self.alpha_m * duration * extension_ratio
-        y_m = torch.exp(-((t - middle_idx) ** 2) / (2 * sigma_m ** 2))
+    def generate_gaussian_labels(self, duration_frame, s_gt, e_gt, stride):
+        """Generate Gaussian labels for start and end.
+        Args:
+            duration_frame (int): duration of memory features in frames.
+            s_gt, e_gt (float): start and end time of the annotation.
+            stride (int):
+        """
+        s, e = 0, duration_frame
         
-        # GT区间内强制为1（左闭右开）
-        gt_mask = (t >= start_idx) & (t < end_idx)
-        y_m[gt_mask] = 1.0
+        span_length = e_gt - s_gt + 1
+        t = np.arange(s, e, stride)
+        sigma_s = self.alpha_s * span_length
+        sigma_e = self.alpha_e * span_length
+        sigma_se = self.alpha_m * span_length
+        s_label = self.__gaussian_label__(t, s_gt, sigma_s, 'start')
+        e_label = self.__gaussian_label__(t, e_gt, sigma_e, 'end')
+        se_label = self.__gaussian_label__(t, (s_gt+e_gt)/2, sigma_se, 'semantic')
+        # # GT区间内强制为1（左闭右开）
+        # gt_mask = (t >= s_gt) & (t < e_gt)
+        # se_label[gt_mask] = 1.0
+        return {'start': s_label, 'middle': se_label, 'end': e_label}
 
-        # ---- 3. 非对称开始/结束标签 ----
-        # 对start_idx使用左闭右开逻辑
-        y_s = self._asymmetric_gaussian(t, start_idx, duration, 'start')
-        # 对end_idx-1使用左闭右开逻辑（因为end_idx是开区间）
-        y_e = self._asymmetric_gaussian(t, end_idx-1, duration, 'end')
+    # def generate_gaussian_labels(self, video_length, start_idx, end_idx):
+    #     """生成非对称和截断高斯的标签（左闭右开区间 [start_idx, end_idx)）"""
+    #     # 单帧事件处理（start_idx == end_idx-1）
+    #     if start_idx == end_idx - 1:
+    #         min_sigma = 1.0
+    #         t = torch.arange(video_length, dtype=torch.float)
+    #         return {
+    #             'start': torch.exp(-((t - start_idx) ** 2) / (2 * min_sigma ** 2)),
+    #             'middle': torch.exp(-((t - (start_idx+0.5)) ** 2) / (2 * min_sigma ** 2)),  # 中点
+    #             'end': torch.exp(-((t - (end_idx-1)) ** 2) / (2 * min_sigma ** 2))
+    #         }
 
-        return {'start': y_s, 'middle': y_m, 'end': y_e}
+    #     # 基础参数
+    #     t = torch.arange(video_length, dtype=torch.float)
+    #     duration = end_idx - start_idx  # 左闭右开区间的长度
+    #     middle_idx = start_idx + duration / 2  # 精确中点
 
-    def _asymmetric_gaussian(self, t, mu, duration, label_type):
-        """生成非对称高斯标签（调整为左闭右开逻辑）"""
-        ratio_ori = 0.1
-        ratio_new = 0.3
-        if label_type == 'start':
-            mask = (t < mu)
-            ratio_ori *= -1
-            ratio_new *= -1
-        else:  # end
-            mask = (t > mu)
+    #     # ---- 1. 设置扩展系数 ----
+    #     extension_ratio = 1.5
+
+    #     # ---- 2. 截断高斯语义标签 ----
+    #     sigma_m = self.alpha_m * duration * extension_ratio
+    #     y_m = torch.exp(-((t - middle_idx) ** 2) / (2 * sigma_m ** 2))
         
-        sigma = self.alpha_s * duration if label_type == 'start' else self.alpha_e * duration
-        s_ori = ratio_ori * (mu - t) + sigma
-        s_new = ratio_new * (t - mu) + sigma
-        s = torch.where(mask, s_ori, s_new)
-        return torch.exp(-((t - mu) ** 2) / (2 * s ** 2))
+    #     # GT区间内强制为1（左闭右开）
+    #     gt_mask = (t >= start_idx) & (t < end_idx)
+    #     y_m[gt_mask] = 1.0
+
+    #     # ---- 3. 非对称开始/结束标签 ----
+    #     # 对start_idx使用左闭右开逻辑
+    #     y_s = self._asymmetric_gaussian(t, start_idx, duration, 'start')
+    #     # 对end_idx-1使用左闭右开逻辑（因为end_idx是开区间）
+    #     y_e = self._asymmetric_gaussian(t, end_idx-1, duration, 'end')
+
+    #     return {'start': y_s, 'middle': y_m, 'end': y_e}
+
+    # def _asymmetric_gaussian(self, t, mu, duration, label_type):
+    #     """生成非对称高斯标签（调整为左闭右开逻辑）"""
+    #     ratio_ori = 0.1
+    #     ratio_new = 0.3
+    #     if label_type == 'start':
+    #         mask = (t < mu)
+    #         ratio_ori *= -1
+    #         ratio_new *= -1
+    #     else:  # end
+    #         mask = (t > mu)
+        
+    #     sigma = self.alpha_s * duration if label_type == 'start' else self.alpha_e * duration
+    #     s_ori = ratio_ori * (mu - t) + sigma
+    #     s_new = ratio_new * (t - mu) + sigma
+    #     s = torch.where(mask, s_ori, s_new)
+    #     return torch.exp(-((t - mu) ** 2) / (2 * s ** 2))
 
     def get_chunk_labels(self, chunk_info):
         """获取当前chunk的标签，考虑多个GT片段
@@ -388,37 +530,12 @@ class StartEndDataset(Dataset):
         vid, qid = chunk_info['vid'], chunk_info['qid']
         chunk_start = chunk_info['short_memory_start']
         chunk_end = chunk_start + self.short_memory_sample_length
-        video_length = chunk_info['duration_frame']
-        
-        # 为每个GT片段生成软标签，取最大值作为最终标签
-        start_labels = []
-        middle_labels = []
-        end_labels = []
-        
-        for gt_window in chunk_info['gt_windows']:
-            # 生成当前GT片段的软标签
-            soft_labels = self.generate_gaussian_labels(
-                video_length=video_length,
-                start_idx=gt_window[0],
-                end_idx=gt_window[1]
-            )
-            if soft_labels is None:
-                continue
-                                        
-            # 截取当前chunk的部分
-            start_labels.append(soft_labels['start'][chunk_start:chunk_end])
-            middle_labels.append(soft_labels['middle'][chunk_start:chunk_end])
-            end_labels.append(soft_labels['end'][chunk_start:chunk_end])
-        
-        # 如果没有有效的标签，返回None
-        if not start_labels:
-            return None
-        
-        # 取所有GT片段的最大值作为最终标签
+
+        # 转换为torch张量
         chunk_labels = {
-            'start_label': torch.max(torch.stack(start_labels), dim=0)[0],
-            'middle_label': torch.max(torch.stack(middle_labels), dim=0)[0],
-            'end_label': torch.max(torch.stack(end_labels), dim=0)[0]
+            'start_label': torch.tensor(self.st_label_dict[(vid, qid)][chunk_start:chunk_end]),
+            'middle_label': torch.tensor(self.mid_label_dict[(vid, qid)][chunk_start:chunk_end]),
+            'end_label': torch.tensor(self.end_label_dict[(vid, qid)][chunk_start:chunk_end])
         }
         
         # 验证标签有效性
@@ -427,11 +544,14 @@ class StartEndDataset(Dataset):
         
         return chunk_labels
 
-    def __getitem__(self, chunk_idx):
+    def __getitem__(self, idx):
         """获取数据样本
         如果标签无效，返回None，在collate_fn中会被过滤掉
         """
-        chunk_info = self.chunk_infos[chunk_idx]
+        if self.test_mode:
+            chunk_info = self.chunk_infos[self.sample_seq[idx]]
+        else:
+            chunk_info = self.chunk_infos[idx]
         
         short_memory_start = chunk_info["short_memory_start"]
         short_memory_end = short_memory_start+self.short_memory_sample_length
@@ -449,8 +569,8 @@ class StartEndDataset(Dataset):
             future_memory_end=min(future_memory_end,self.data[chunk_info["chunk_idx"]]["duration"])
 
         model_inputs = dict()
-        model_inputs["chunk_idx"] = chunk_idx  # 添加 chunk_idx
-        model_inputs["short_memory_start"] = {"spans": short_memory_start}
+        model_inputs["chunk_idx"] = chunk_info["chunk_idx"]  # 添加 chunk_idx
+        model_inputs["short_memory_start"] = short_memory_start
         
         # 修改查询特征的处理
         if self.use_glove:
@@ -469,10 +589,24 @@ class StartEndDataset(Dataset):
             if self.long_memory_sample_length > 0:
                 model_inputs["video_feat_long"]=whole_video_feature[long_memory_start:long_memory_end:self.long_memory_stride]  
                 ctx_l_long=len(model_inputs["video_feat_long"])
-            #   future memory
-            if self.load_future_memory and self.future_memory_sample_length > 0:
-                model_inputs["video_feat_future"]=whole_video_feature[future_memory_start:future_memory_end:self.future_memory_stride] 
-                ctx_l_future=len(model_inputs["video_feat_future"])
+                # if model_inputs["video_feat_long"].shape[0] == 0 and model_inputs["video_feat_long"].shape[1] != model_inputs["video_feat_short"].shape[1] or chunk_info["chunk_idx"] == 1048:
+                #     print("shape: ", whole_video_feature.shape, long_memory_start, long_memory_end, self.long_memory_stride)
+                #     print("long memory: ", model_inputs["video_feat_long"].shape)
+                #     print("short memory: ", model_inputs["video_feat_short"].shape)
+                #     print("chunk info: ", chunk_info)
+                #     input("press enter")
+                if not self.test_mode:
+                    # 从 mid_label_dict 获取权重
+                    vid, qid = chunk_info['vid'], chunk_info['qid']
+                    mid_labels = self.mid_label_dict[(vid, qid)]
+                    # 截取对应区间并下采样
+                    long_memory_weights = mid_labels[long_memory_start:long_memory_end:self.long_memory_stride]
+                    model_inputs["long_memory_weight"] = torch.tensor(long_memory_weights)
+                else:
+                    model_inputs["qid_vid"] = [chunk_info['qid'], chunk_info['vid']]
+                    model_inputs["short_memory_start"] = short_memory_start
+
+
 
         #?# 这里如果使用tef编码的话，需要根据模型如何使用feat调整：是拼接后使用tef编码，还是分别进行tef编码
         if self.use_tef:
@@ -487,58 +621,53 @@ class StartEndDataset(Dataset):
                 model_inputs["video_feat_short"] = tef_short
             
             #   long
-            if ctx_l_long > 0:  # 添加判断
+            if ctx_l_long > 0:
+                # 正常情况：计算时间编码
                 tef_st_long = torch.arange(0, ctx_l_long, 1.0) / ctx_l_long
                 tef_ed_long = tef_st_long + 1.0 / ctx_l_long
-                tef_long = torch.stack([tef_st_long, tef_ed_long], dim=1)
-                if self.use_video:
-                    model_inputs["video_feat_long"] = torch.cat(
-                        [model_inputs["video_feat_long"], tef_long], dim=1)
-                else:
-                    model_inputs["video_feat_long"] = tef_long
-            #   future
-            if self.load_future_memory and self.future_memory_sample_length>0:
-                tef_st_future = torch.arange(0, ctx_l_future, 1.0) / ctx_l_future
-                tef_ed_future = tef_st_future + 1.0 / ctx_l_future
-                tef_future = torch.stack([tef_st_future, tef_ed_future], dim=1)  # (Lv, 2)
-                if self.use_video:
-                    model_inputs["video_feat_future"] = torch.cat(
-                        [model_inputs["video_feat_future"], tef_future], dim=1)  # (Lv, Dv+2)
-                else:
-                    model_inputs["video_feat_future"] = tef_future
+                tef_long = torch.stack([tef_st_long, tef_ed_long], dim=1)  # shape: [L, 2]
+            else:
+                tef_long = torch.zeros(0, 2)  # shape: [0, 2]（与空视频特征对齐）
+            if self.use_video:
+                model_inputs["video_feat_long"] = torch.cat(
+                    [model_inputs["video_feat_long"], tef_long], 
+                    dim=1
+                )
+            else:
+                model_inputs["video_feat_long"] = tef_long
+                
         # Span Label
         ## Short-term label
         model_inputs["start_label"] = chunk_info["start_label"]
         model_inputs["middle_label"] = chunk_info["middle_label"]
         model_inputs["end_label"] = chunk_info["end_label"]
 
-        # chunk_labels = self.get_chunk_labels(chunk_info)
-        # if chunk_labels is not None:
-        #     model_inputs['start_label'] = chunk_labels['start_label']
-        #     model_inputs['middle_label'] = chunk_labels['middle_label']
-        #     model_inputs['end_label'] = chunk_labels['end_label']
-        # else:
-        #     return None  # 如果标签生成失败，返回None
-        
         #   Saliency Label
         model_inputs["saliency_pos_labels"] = chunk_info["saliency_pos_labels"]
         model_inputs["saliency_neg_labels"] = chunk_info["saliency_neg_labels"]
         model_inputs["saliency_all_labels"] = chunk_info["saliency_all_labels"]
         
-        # boundary=[short_memory_start,short_memory_end]
-        # if 'qvhighlight' in self.dset_name:
-        #     if "subs_train" in self.data_path: # for pretraining
-        #         model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
-        #             self.get_saliency_labels_sub_as_query(boundary,chunk_info["gt_windows"], self.short_memory_sample_length)
-        #     else:
-        #         model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
-        #             self.get_saliency_labels_all(chunk_info["gt_windows"],self.saliency_scores_list[chunk_info["vid"],chunk_info["qid"]],boundary)                        
-        
-        # elif self.dset_name in ['charades', 'tacos', 'activitynet', 'clotho-moment', 'unav100-subset', 'tut2017']:
-        #     model_inputs["saliency_pos_labels"], model_inputs["saliency_neg_labels"], model_inputs["saliency_all_labels"] = \
-        #         self.get_saliency_labels_sub_as_query(boundary,chunk_info["gt_windows"], self.short_memory_sample_length)
-        # else:
-        #     raise NotImplementedError
+        # if chunk_info["qid"] == 9539:
+        #     print("wait! check a sample for model input")
+        #     for key, value in model_inputs.items():
+        #         #如果是tensor类型
+        #         if isinstance(value, torch.Tensor):
+        #             print(f"{key}:shape {value.shape}:\n {value}")
+        #         else:
+        #             print(f"{key}: {value}")
+        #     print("chunk_info: ",chunk_info)
+        #     input("Press Enter to continue...")
+        # if chunk_info["qid"] == 6083:
+        #     print("wait! check a sample for model input")
+        #     for key, value in model_inputs.items():
+        #         #如果是tensor类型
+        #         if isinstance(value, torch.Tensor):
+        #             print(f"{key}:shape {value.shape}:{value}")
+        #         else:
+        #             print(f"{key}: {value}")
+        #     print("chunk_info: ",chunk_info)
+        #     input("Press Enter to continue...")
+
 
         return dict(meta=chunk_info, model_inputs=model_inputs)
     
@@ -701,7 +830,7 @@ class StartEndDataset(Dataset):
 
         return torch.from_numpy(v_feat)  # (Lv, D)
 
-def start_end_collate_ol(batch):
+def start_end_collate_ol(batch, long_memory_sample_length = None):
     """处理batch数据，过滤掉无效样本"""
     # 过滤None值
     batch = [b for b in batch if b is not None]
@@ -724,6 +853,9 @@ def start_end_collate_ol(batch):
     for idx, inputs in enumerate(model_inputs_list):
         if all(k in inputs for k in required_keys):
             valid_indices.append(idx)
+
+    if len(valid_indices) < len(model_inputs_list):
+        print(f"{len(model_inputs_list) - len(valid_indices)} samples are invalid and filtered out")
     
     # 只保留有效样本
     metas = [metas[i] for i in valid_indices]
@@ -731,61 +863,55 @@ def start_end_collate_ol(batch):
     
     if len(valid_indices) == 0:
         return None
-        
     # 继续处理有效样本
-    batched_model_inputs = {}
-    for key in model_inputs_list[0].keys():
-        if isinstance(model_inputs_list[0][key], torch.Tensor):
-            # batched_model_inputs[key] = torch.stack([
-            #     inputs[key] for inputs in model_inputs_list
-            # ])
-             # 获取当前key下所有tensor的shape
-            tensors = [inputs[key] for inputs in model_inputs_list]
-            shapes = [t.shape for t in tensors]
-            
-            # 检查是否需要padding
-            if len(shapes[0]) == 2:  # 只处理2D张量
-                max_dim0 = max(s[0] for s in shapes)
-                max_dim1 = max(s[1] for s in shapes)
-                
-                padded_tensors = []
-                for tensor in tensors:
-                    if tensor.shape[0] < max_dim0 or tensor.shape[1] < max_dim1:
-                        # 创建填充后的张量
-                        padded = torch.zeros(max_dim0, max_dim1,
-                                          dtype=tensor.dtype,
-                                          device=tensor.device)
-                        # 复制原始数据
-                        padded[:tensor.shape[0], :tensor.shape[1]] = tensor
-                        padded_tensors.append(padded)
-                    else:
-                        padded_tensors.append(tensor)
-                
-                try:
-                    batched_model_inputs[key] = torch.stack(padded_tensors)
-                except Exception as e:
-                    print(f"Error stacking tensors for key {key}")
-                    print(f"Tensor shapes: {[t.shape for t in padded_tensors]}")
-                    raise e
-            else:
-                # 对于非2D张量，直接尝试stack
-                batched_model_inputs[key] = torch.stack(tensors)
+    batched_model_inputs = dict()
 
-        elif isinstance(model_inputs_list[0][key], dict):
-            # 处理嵌套字典，如short_memory_start
-            batched_model_inputs[key] = {
-                k: torch.stack([inputs[key][k] for inputs in model_inputs_list])
-                if isinstance(model_inputs_list[0][key][k], torch.Tensor)
-                else [inputs[key][k] for inputs in model_inputs_list]
-                for k in model_inputs_list[0][key].keys()
-            }
-        else:
-            batched_model_inputs[key] = [inputs[key] for inputs in model_inputs_list]
+    for k in model_inputs_list[0].keys():
+        if k in ["saliency_pos_labels", "saliency_neg_labels", "chunk_idx", "short_memory_start"]:
+            batched_model_inputs[k] = torch.LongTensor([model_inputs_list[i][k] for i in valid_indices])
+            continue
+        if k == "qid_vid":
+            batched_model_inputs[k] = [model_inputs_list[i][k] for i in valid_indices]  # 保持原样
+            continue
+        if k in ["saliency_all_labels"]:
+            pad_data, mask_data = pad_sequences_1d([model_inputs_list[i][k] for i in valid_indices], dtype=np.float32, fixed_length=None)
+            batched_model_inputs[k] = torch.tensor(pad_data, dtype=torch.float32)
+            continue
+        if k in ["start_label", "middle_label", "end_label"]:
+            pad_data, mask_data = pad_sequences_1d([model_inputs_list[i][k] for i in valid_indices], dtype=torch.float32, fixed_length=None)
+            batched_model_inputs[k] = torch.tensor(pad_data, dtype=torch.float32)
+            continue
+        if k in ["video_feat_long"]:
+            input_list = [model_inputs_list[i][k] for i in valid_indices]
+            batched_model_inputs[k] = pad_sequences_1d(
+                input_list, dtype=torch.float32, fixed_length=long_memory_sample_length)
+            continue
+        if k in ["long_memory_weight"]:
+            batched_model_inputs[k] = pad_sequences_1d(
+                [model_inputs_list[i][k] for i in valid_indices], dtype=torch.float32, fixed_length=long_memory_sample_length)
+            continue
+        if k in ["video_feat_short"]:
+            input_list = [model_inputs_list[i][k] for i in valid_indices]
+            batched_model_inputs[k] = pad_sequences_1d(
+                input_list, dtype=torch.float32, fixed_length=None)
+            continue
+
+        batched_model_inputs[k] = pad_sequences_1d(
+            [model_inputs_list[i][k] for i in valid_indices], dtype=torch.float32, fixed_length=None)
     
-    # 添加 chunk_idx 到 batched_model_inputs
-    batched_model_inputs["chunk_idx"] = torch.tensor(
-        [inputs["chunk_idx"] for inputs in model_inputs_list]
-    )
+    # # 逐个检查batched_model_inputs，从键盘读入控制停止的信息    
+    # flag = 1
+    # while flag:
+    #     for key, value in batched_model_inputs.items():
+    #         if key in ["video_feat_long", "video_feat_short"]:
+    #             print(f"{key}: {len(value[0])}*{len(value[0][0])}\n{value}")
+    #         elif isinstance(value, torch.Tensor):
+    #             print(f"{key}: {value.shape}\n{value}")
+    #         else:
+    #             print(f"{key}: {type(value)}\n{value}")
+            
+    #     flag = int(input("是否继续检查batched_model_inputs？1-是，0-否："))
+
     return metas, batched_model_inputs
 
 def prepare_batch_inputs(metas, batched_model_inputs, device, non_blocking=False):
@@ -799,40 +925,58 @@ def prepare_batch_inputs(metas, batched_model_inputs, device, non_blocking=False
         model_inputs: dict, 模型输入
         targets: dict, 目标标签
     """
+
     model_inputs = {}
     
     # 1. 处理视频特征
     if 'video_feat_short' in batched_model_inputs:
         if 'video_feat_long' in batched_model_inputs:
             video_feats = [
-                batched_model_inputs['video_feat_long'],
-                batched_model_inputs['video_feat_short']
+                batched_model_inputs['video_feat_long'][0],
+                batched_model_inputs['video_feat_short'][0]
+            ]
+            video_masks = [
+                batched_model_inputs['video_feat_long'][1],
+                batched_model_inputs['video_feat_short'][1]
             ]
             if 'video_feat_future' in batched_model_inputs:
-                video_feats.append(batched_model_inputs['video_feat_future'])
-            src_vid = torch.cat(video_feats, dim=1)
+                video_feats.append(batched_model_inputs['video_feat_future'][0])
+                video_masks.append(batched_model_inputs['video_feat_future'][1])
+            try:    
+                src_vid = torch.cat(video_feats, dim=1)
+                src_vid_mask = torch.cat(video_masks, dim=1)
+            except Exception as e:
+                print("video_feats: ", video_feats)
+                print("video_feats.shape: ", video_feats[0].shape, video_feats[1].shape)
+                print("Error concatenating video features:", e)
+                raise
         else:
-            src_vid = batched_model_inputs['video_feat_short']
+            src_vid = batched_model_inputs['video_feat_short'][0]
+            src_vid_mask = batched_model_inputs['video_feat_short'][1]
     
     # 3. 基本输入处理
     model_inputs.update({
         'src_vid': src_vid.to(device, non_blocking=non_blocking),
-        'src_txt': batched_model_inputs['query_feat'].to(device, non_blocking=non_blocking),
-        'src_vid_mask': torch.ones(src_vid.shape[:2], dtype=torch.long, device=device),
-        'src_txt_mask': torch.ones(batched_model_inputs['query_feat'].shape[:2], 
-                                 dtype=torch.long, device=device),
+        'src_txt': batched_model_inputs['query_feat'][0].to(device, non_blocking=non_blocking),
+        'src_vid_mask': src_vid_mask.to(device, non_blocking=non_blocking),
+        'src_txt_mask': batched_model_inputs['query_feat'][1].to(device, non_blocking=non_blocking),
         'chunk_idx': batched_model_inputs['chunk_idx'].to(device, non_blocking=non_blocking)  # 添加 chunk_idx
     })
-    
+    if 'long_memory_weight' in batched_model_inputs:
+        model_inputs['long_memory_weight'] = batched_model_inputs['long_memory_weight'][0].to(device, non_blocking=non_blocking)
+    if 'qid_vid' in batched_model_inputs:
+        model_inputs['qid_vid'] = batched_model_inputs['qid_vid']
+    if 'short_memory_start' in batched_model_inputs:
+        model_inputs['short_memory_start'] = batched_model_inputs['short_memory_start']
+
     # 4. 处理memory长度信息
 
-    vid_feat_long = batched_model_inputs.get('video_feat_long', None)
-    vid_feat_future = batched_model_inputs.get('video_feat_future', None)
+    vid_feat_long = batched_model_inputs.get('video_feat_long', None)[0]
 
     model_inputs['memory_len'] = [
-        vid_feat_long.shape[1] if vid_feat_long is not None else 0,
-        batched_model_inputs['video_feat_short'].shape[1],
-        vid_feat_future.shape[1] if vid_feat_future is not None else 0,
+        len(batched_model_inputs['video_feat_long'][0][0]) if vid_feat_long is not None else 0,
+        len(batched_model_inputs['video_feat_short'][0][0]),
+        0,
     ]
     
     # 5. 处理标签
@@ -853,5 +997,19 @@ def prepare_batch_inputs(metas, batched_model_inputs, device, non_blocking=False
     
     # 6. 添加meta信息
     targets['meta'] = metas
-    
+
+    # # 检查每个样本的内容
+    # print("memory_len:", model_inputs['memory_len'])
+    # flag = 1
+    # for i in tqdm(range(len(model_inputs['src_vid']))):
+    #     for key in model_inputs:
+    #         if key == 'memory_len':
+    #             continue
+    #         if isinstance(model_inputs[key], torch.Tensor):
+    #             print(f"{key}: {model_inputs[key][i].shape}\n{model_inputs[key][i]}")
+    #         else:
+    #             print(f"{key}: {type(model_inputs[key][i])}\n{model_inputs[key][i]}")
+    #     flag = int(input("是否继续检查batched_model_inputs？1-是，0-否："))
+    #     if flag == 0:
+    #         break
     return model_inputs, targets

@@ -217,6 +217,10 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
         metas, batched_inputs = batch  # 解包 batch
         model_inputs, targets = batch_input_fn(metas, batched_inputs, opt.device)  # 正确传递所有参数
 
+        # print("batched_inputs keys:", batched_inputs.keys())
+        # print("当前batch的short_memory_start和vid： ", batched_inputs["short_memory_start"])
+        # input("check short_memory_start...")
+
         #   获得模型输出
         if opt.model_name == 'taskweave':
             model_inputs['epoch_i'] = epoch_i
@@ -289,8 +293,6 @@ def get_eval_res(epoch_i, model, eval_loader, opt, criterion):
 
 
 def eval_epoch(epoch_i, model, eval_dataset, opt, save_submission_filename, criterion=None):
-    # collate_fn = cg_detr_start_end_collate if opt.model_name == 'cg_detr' else start_end_collate_ol
-    collate_fn = start_end_collate_ol
     logger.info("Generate submissions")
     model.eval()
     if criterion is not None:
@@ -298,11 +300,14 @@ def eval_epoch(epoch_i, model, eval_dataset, opt, save_submission_filename, crit
 
     eval_loader = DataLoader(
         eval_dataset,
-        collate_fn=collate_fn,
+        collate_fn=lambda batch: start_end_collate_ol(batch, long_memory_sample_length=eval_dataset.long_memory_sample_length),
         batch_size=opt.eval_bsz,
         num_workers=opt.num_workers,
         shuffle=False,
     )
+
+    # reset mid_label_dict
+    model.reset_mid_label_dict()
 
     # if opt.dset_name == 'tvsum' or opt.dset_name == 'youtube_highlight':
     #     metrics, eval_loss_meters = compute_hl_results(epoch_i, model, eval_loader, opt, criterion)

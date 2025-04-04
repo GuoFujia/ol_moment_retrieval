@@ -5,17 +5,17 @@ num_workers: 0
 # short_memory_len : 8
 # long_memory_sample_len: 32
 # future_memory_sample_len: 0
-num_queries: 10
 
-use_vid_compression: True
 
-lr: 0.0001
-lr_drop: 400
-wd: 0.0001
-n_epoch: 50
+use_vid_compression: False
+
+lr: 0.0004  # 0.0001-> AdamW，和bsz等比例调整
+lr_drop: 100  # 400 按照epoch比例调整  
+wd: 0.0001 
+n_epoch: 50 # 200
 max_es_cnt: 200
-bsz: 32
-eval_bsz: 50
+bsz: 128 # 32
+eval_bsz: 100
 grad_clip: 0.1
 max_q_l: 32
 max_v_l: 75
@@ -31,6 +31,7 @@ hidden_dim: 256
 input_dropout: 0.5
 dropout: 0.1
 nheads: 8
+num_queries: 10
 
 n_input_proj: 2
 saliency_margin: 0.2
@@ -42,13 +43,14 @@ span_loss_coef: 10
 giou_loss_coef: 1
 label_loss_coef: 4
 
+eos_coef: 0.1
 start_label_loss_coef: 10
 middle_label_loss_coef: 10
 end_label_loss_coef: 10
 saliency_loss_coef: 5   
 
 lw_saliency: 1
-eos_coef: 0.1
+
 
 
 ckpt_filename: best.ckpt
