@@ -37,6 +37,7 @@ SOFTWARE.
 """
 
 import signal
+import math
 import numpy as np
 from collections import OrderedDict, defaultdict
 import json
@@ -597,10 +598,23 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
         for m in iou_thresholds:
             r_at_n_metrics[f"R@{n},IoU={m}"] = 0.0
 
+    # from openpyxl import Workbook
+
+    # # 创建Excel工作簿
+    # wb = Workbook()
+    # ws = wb.active
+
+    # # 写入标题行
+    # ws.append(["qid", "gt_st", "gt_ed", 
+    #         "st1", "ed1", "st2", "ed2", "st3", "ed3", "st4", "ed4", "st5", "ed5"])
+
+
     # 遍历每个匹配的 query-video 组
     for key, group in matched_data_grouped.items():
-        if len(group) < 2:
-            continue
+        # if len(group) < 2:
+        #     print(group)
+        #     input("wait!\n\n")
+        #     continue
         # 获取该组的第一个gt来获取视频总长度
         _, first_gt = group[0]
         clip_length = first_gt["duration_frame"]
@@ -616,15 +630,16 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
         for t in range(len(main_gt["start_label"])):
             all_pred_indices.append(main_start + t)  # 主样本的时间步索引
         
-        # 处理后续样本（从第二个开始）
-        for i in range(1, len(group)):
-            cur_sub, cur_gt = group[i]
-            cur_start = cur_gt["short_memory_start"]
-            cur_length = len(cur_gt["start_label"])
-            
-            # 取最后 eval_interval 个时间步的索引
-            for t in range(eval_interval):
-                all_pred_indices.append(cur_start + cur_length - eval_interval + t)
+        if len(group) > 1:
+            # 处理后续样本（从第二个开始）
+            for i in range(1, len(group)):
+                cur_sub, cur_gt = group[i]
+                cur_start = cur_gt["short_memory_start"]
+                cur_length = len(cur_gt["start_label"])
+                
+                # 取最后 eval_interval 个时间步的索引
+                for t in range(eval_interval):
+                    all_pred_indices.append(cur_start + cur_length - eval_interval + t)
 
         # 生成跨chunk的候选片段
         candidate_moments = generate_cross_chunk_candidate_moments(
@@ -633,21 +648,20 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
             ed_probs=all_ed_probs,
             clip_length=clip_length
         )
-
-        # # 获取该组的所有真实片段并去重
-        # gt_spans_set = set()
-        # for _, gt in group:
-        #     gt_start = gt["short_memory_start"] + np.argmax(gt["start_label"])
-        #     gt_end = gt["short_memory_start"] + np.argmax(gt["end_label"])
-        #     if gt_start < gt_end:
-        #         gt_spans_set.add((gt_start, gt_end))
-
-        # gt_spans = list(gt_spans_set)
         
         #直接从样本中取gt_windows
         gt_spans = group[0][1]["gt_windows"]
 
-
+        # # 写入数据
+        # ws.append([
+        #     group[0][1]["qid"], 
+        #     gt_spans[0][0], gt_spans[0][1],
+        #     candidate_moments[0][0], candidate_moments[0][1],
+        #     candidate_moments[1][0], candidate_moments[1][1],
+        #     candidate_moments[2][0], candidate_moments[2][1],
+        #     candidate_moments[3][0], candidate_moments[3][1],
+        #     candidate_moments[4][0], candidate_moments[4][1]
+        # ])
 
         # 计算该组的 R@n, IoU=m
         for n in n_list:
@@ -659,6 +673,8 @@ def eval_submission_ol_2(submission, ground_truth, saliency_scores_all,
                     if max_iou >= m:
                         r_at_n_metrics[f"R@{n},IoU={m}"] += 1
                         break  # 只要有一个真实片段满足条件就可以
+    # # 保存Excel文件
+    # wb.save("output.xlsx")
 
     # 转换为百分比
     total_queries = len(matched_data_grouped)
@@ -820,45 +836,104 @@ def generate_cross_chunk_candidate_moments(pred_starts, st_probs, ed_probs, clip
     
     res = [(start, end) for start, end, _ in keep[:topk]]
 
-    # # 并打印前5个候选片段,再打印这几个片段的置信度（prob_st,prob_ed）
-    # print("前5个候选片段:")
-    # for i, (start, end) in enumerate(res[:5]):
-    #     print(f"  {i+1}. 起始帧: {start}, 结束帧: {end}, 持续时间: {end-start} 帧")
-    #     print(f"   置信度: prob_st={st_probs[i]}, prob_ed={ed_probs[j]}")
-    # # 暂停程序
-    # input("请按回车键继续...")
-
     return res
 
-def generate_candidate_moments(pred_start, st_probs, ed_probs, clip_length, topk=100):
-    """
-    生成候选片段：
-    1. 根据 st_probs 和 ed_probs 生成候选 (start, end) 对
-    2. 按置信度排序（st_prob * ed_prob）
-    3. 使用 NMS 去除重叠片段
-    """
-    # 生成所有可能的候选
-    candidates = []
-    for i in range(len(st_probs)):
-        for j in range(i, len(ed_probs)):
-            if j - i >= 1:  # 至少持续1帧
-                conf = st_probs[i] * ed_probs[j]
-                start_global = pred_start + i
-                end_global = pred_start + j
-                # candidates.append((start_global, end_global, conf))
-                candidates.append((start_global, end_global, conf))
-
-    # 按置信度降序排序
-    candidates.sort(key=lambda x: x[2], reverse=True)
-
-    # 非极大值抑制 (NMS)
-    keep = []
-    while candidates:
-        keep.append(candidates[0])
-        candidates = [c for c in candidates if 
-            calculate_iou((c[0], c[1]), (keep[-1][0], keep[-1][1])) < 0.5]
+# def generate_cross_chunk_candidate_moments(pred_starts, st_probs, ed_probs, clip_length, topk=100):
+#     """
+#     基于稀疏采样策略优化的跨chunk候选生成
     
-    return [(start, end) for start, end, _ in keep[:topk]]
+#     参数:
+#         pred_starts: 每个预测概率对应的起始帧位置列表
+#         st_probs: 所有chunk拼接后的开始概率列表
+#         ed_probs: 所有chunk拼接后的结束概率列表
+#         clip_length: 视频总帧数
+#         topk: 返回的候选片段数量
+        
+#     返回:
+#         候选片段列表，每个元素为 (start, end) 元组
+#     """
+#     def generate_sparse_pairs(n, group_size=4):
+#         """生成稀疏的(start, end)候选对"""
+#         pairs = []
+#         # 生成层级式候选间隔
+#         max_level = math.ceil(math.log(n/group_size, 2)) if n > 0 else 0
+#         for k in range(max_level+1):
+#             stride = 2**k
+#             for i in range(0, n, stride):
+#                 # 结束点生成规则
+#                 for j_step in [1, 2, 4, 8]:  # 几何级数步长
+#                     j = i + stride * j_step
+#                     if j >= n:
+#                         continue
+#                     if (j - i) % (2**k) == 0:  # 保持边界对齐
+#                         pairs.append((i, j))
+#         return list(set(pairs))  # 去重
+
+#     # Step 1: 生成稀疏候选对
+#     L = len(st_probs)
+#     sparse_pairs = generate_sparse_pairs(L)
+    
+#     # Step 2: 生成有效候选
+#     candidates = []
+#     for i, j in sparse_pairs:
+#         # 计算全局时间位置
+#         start_global = pred_starts[i]
+#         end_global = pred_starts[j]
+        
+#         # 转换为绝对帧位置
+#         start_frame = start_global + i - pred_starts[i]
+#         end_frame = end_global + j - pred_starts[j]
+        
+#         # 有效性检查
+#         if 0 <= start_frame < end_frame < clip_length:
+#             conf = st_probs[i] * ed_probs[j]
+#             candidates.append((start_frame, end_frame, conf))
+
+#     # Step 3: 置信度排序（保留top 5k避免内存问题）
+#     candidates.sort(key=lambda x: x[2], reverse=True)
+#     candidates = candidates[:min(5000, len(candidates))]
+
+#     # Step 4: 改进型NMS
+#     keep = []
+#     while candidates and len(keep) < 2*topk:
+#         current = candidates.pop(0)
+#         # 重叠判断
+#         if not any(calculate_iou((current[0], current[1]), (k[0], k[1])) > 0.5 for k in keep):
+#             keep.append(current)
+    
+#     # 按置信度取最终topk
+#     keep.sort(key=lambda x: x[2], reverse=True)
+#     return [(s, e) for s, e, _ in keep[:topk]]
+
+# def generate_candidate_moments(pred_start, st_probs, ed_probs, clip_length, topk=100):
+#     """
+#     生成候选片段：
+#     1. 根据 st_probs 和 ed_probs 生成候选 (start, end) 对
+#     2. 按置信度排序（st_prob * ed_prob）
+#     3. 使用 NMS 去除重叠片段
+#     """
+#     # 生成所有可能的候选
+#     candidates = []
+#     for i in range(len(st_probs)):
+#         for j in range(i, len(ed_probs)):
+#             if j - i >= 1:  # 至少持续1帧
+#                 conf = st_probs[i] * ed_probs[j]
+#                 start_global = pred_start + i
+#                 end_global = pred_start + j
+#                 # candidates.append((start_global, end_global, conf))
+#                 candidates.append((start_global, end_global, conf))
+
+#     # 按置信度降序排序
+#     candidates.sort(key=lambda x: x[2], reverse=True)
+
+#     # 非极大值抑制 (NMS)
+#     keep = []
+#     while candidates:
+#         keep.append(candidates[0])
+#         candidates = [c for c in candidates if 
+#             calculate_iou((c[0], c[1]), (keep[-1][0], keep[-1][1])) < 0.5]
+    
+#     return [(start, end) for start, end, _ in keep[:topk]]
 
 def eval_main():
     import argparse

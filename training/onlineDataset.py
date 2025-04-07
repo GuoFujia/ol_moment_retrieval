@@ -437,7 +437,8 @@ class StartEndDataset(Dataset):
             s = np.ma.array(s_ori, mask=mask)
             s = s.filled(s_new)
             t = - np.power((t - mu) / s, 2) / 2
-        return np.exp(t)
+        res = np.exp(t)
+        return res
 
     def generate_gaussian_labels(self, duration_frame, s_gt, e_gt, stride):
         """Generate Gaussian labels for start and end.
@@ -450,6 +451,7 @@ class StartEndDataset(Dataset):
         
         span_length = e_gt - s_gt + 1
         t = np.arange(s, e, stride)
+
         sigma_s = self.alpha_s * span_length
         sigma_e = self.alpha_e * span_length
         sigma_se = self.alpha_m * span_length
@@ -555,8 +557,13 @@ class StartEndDataset(Dataset):
         
         short_memory_start = chunk_info["short_memory_start"]
         short_memory_end = short_memory_start+self.short_memory_sample_length
+
+        # long_memory_start=0
+        # long_memory_end=short_memory_start
         long_memory_start=None
         long_memory_end=None
+
+        # 取全部history的话，就没有long_memory_sample_length这个概念了
         if self.long_memory_sample_length > 0:
             long_memory_start = short_memory_start - self.long_memory_sample_length
             long_memory_start=max(long_memory_start,0)
@@ -586,25 +593,19 @@ class StartEndDataset(Dataset):
             model_inputs["video_feat_short"]=whole_video_feature[short_memory_start:short_memory_end:self.short_memory_stride]
             ctx_l_short=len(model_inputs["video_feat_short"])
             #   long memory 
-            if self.long_memory_sample_length > 0:
-                model_inputs["video_feat_long"]=whole_video_feature[long_memory_start:long_memory_end:self.long_memory_stride]  
-                ctx_l_long=len(model_inputs["video_feat_long"])
-                # if model_inputs["video_feat_long"].shape[0] == 0 and model_inputs["video_feat_long"].shape[1] != model_inputs["video_feat_short"].shape[1] or chunk_info["chunk_idx"] == 1048:
-                #     print("shape: ", whole_video_feature.shape, long_memory_start, long_memory_end, self.long_memory_stride)
-                #     print("long memory: ", model_inputs["video_feat_long"].shape)
-                #     print("short memory: ", model_inputs["video_feat_short"].shape)
-                #     print("chunk info: ", chunk_info)
-                #     input("press enter")
-                if not self.test_mode:
-                    # 从 mid_label_dict 获取权重
-                    vid, qid = chunk_info['vid'], chunk_info['qid']
-                    mid_labels = self.mid_label_dict[(vid, qid)]
-                    # 截取对应区间并下采样
-                    long_memory_weights = mid_labels[long_memory_start:long_memory_end:self.long_memory_stride]
-                    model_inputs["long_memory_weight"] = torch.tensor(long_memory_weights)
-                else:
-                    model_inputs["qid_vid"] = [chunk_info['qid'], chunk_info['vid']]
-                    model_inputs["short_memory_start"] = short_memory_start
+            # if self.long_memory_sample_length > 0:
+            model_inputs["video_feat_long"]=whole_video_feature[long_memory_start:long_memory_end:self.long_memory_stride]  
+            ctx_l_long=len(model_inputs["video_feat_long"])
+            if not self.test_mode:
+                # 从 mid_label_dict 获取权重
+                vid, qid = chunk_info['vid'], chunk_info['qid']
+                mid_labels = self.mid_label_dict[(vid, qid)]
+                # 截取对应区间并下采样
+                long_memory_weights = mid_labels[long_memory_start:long_memory_end:self.long_memory_stride]
+                model_inputs["long_memory_weight"] = torch.tensor(long_memory_weights)
+            else:
+                model_inputs["qid_vid"] = [chunk_info['qid'], chunk_info['vid']]
+                model_inputs["short_memory_start"] = short_memory_start
 
 
 

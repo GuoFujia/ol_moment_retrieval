@@ -12,4 +12,6 @@ max_q_l: 100
 # max_v_l: 500
 # max_q_l: 100
 
+use_vid_compression: True
+
 compress_len: 16

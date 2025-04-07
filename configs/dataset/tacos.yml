@@ -13,7 +13,10 @@ long_memory_sample_len: 64
 future_memory_sample_len: 0
 
 lw_saliency: 4
-lr: 0.0002
+lr: 0.0005  #0.0002
 lr_drop: 40
 
-compress_len: 16
+use_vid_compression: True
+
+# compress_len: 16
+compress_len: 64

@@ -300,7 +300,8 @@ def eval_epoch(epoch_i, model, eval_dataset, opt, save_submission_filename, crit
 
     eval_loader = DataLoader(
         eval_dataset,
-        collate_fn=lambda batch: start_end_collate_ol(batch, long_memory_sample_length=eval_dataset.long_memory_sample_length),
+        # collate_fn=lambda batch: start_end_collate_ol(batch, long_memory_sample_length=eval_dataset.long_memory_sample_length),
+        collate_fn = start_end_collate_ol,
         batch_size=opt.eval_bsz,
         num_workers=opt.num_workers,
         shuffle=False,
