@@ -550,10 +550,13 @@ class StartEndDataset(Dataset):
         """获取数据样本
         如果标签无效，返回None，在collate_fn中会被过滤掉
         """
-        if self.test_mode:
-            chunk_info = self.chunk_infos[self.sample_seq[idx]]
-        else:
-            chunk_info = self.chunk_infos[idx]
+        # if self.test_mode:
+        #     chunk_info = self.chunk_infos[self.sample_seq[idx]]
+        # else:
+        #     chunk_info = self.chunk_infos[idx]
+        chunk_info = self.chunk_infos[self.sample_seq[idx]]
+        # chunk_info = self.chunk_infos[idx]
+    
         
         short_memory_start = chunk_info["short_memory_start"]
         short_memory_end = short_memory_start+self.short_memory_sample_length

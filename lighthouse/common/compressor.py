@@ -1,5 +1,6 @@
 import numpy as np
 import torch
+import math
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -338,14 +339,10 @@ class VideoMemoryCompressorWithExternalWeights(nn.Module):
         # 9. 残差连接和最终层归一化
         Fv_compress = self.final_norm(attn_output + ff_output)
 
-        # 10. 将多头注意力权重平均为单头形式以便返回
-        # (batch_size, num_heads, compress_len, vid_len) -> (batch_size, compress_len, vid_len)
-        combined_weights_single = combined_weights.mean(dim=1)
-
         # 创建压缩后的掩码，形状为 (batch_size, compress_len)，全为True
         compress_mask = torch.ones((batch_size, self.compress_len), dtype=torch.bool, device=Fv.device)
         
-        return Fv_compress, compress_mask, combined_weights_single
+        return Fv_compress, compress_mask
 
 
 class MultimodalTokenCompressor(nn.Module):
@@ -359,31 +356,31 @@ class MultimodalTokenCompressor(nn.Module):
             dropout=dropout
         )
 
-    def forward(self, video_feats, query=None):
+    def forward(self, Fv, query=None, mask=None, query_mask=None):
         """
         Args:
-            video_feats: (bsz, v_len, v_dim)
-            query: (bsz, q_len, v_dim) 或 None（若无需多模态）
+            Fv: (bsz, v_len, v_dim)
+            query: (bsz, q_len, v_dim)
+            mask: [B, T]
         Returns:
             compressed_feats: (bsz, compress_len, v_dim)
             weights: (bsz, compress_len, v_len)
         """
-        if query is None:
-            # 若无查询，用均值作为伪查询
-            query = video_feats.mean(dim=1, keepdim=True)  # (bsz, 1, v_dim)
+        # if query is None:
+        #     # 若无查询，用均值作为伪查询
+        #     query = video_feats.mean(dim=1, keepdim=True)  # (bsz, 1, v_dim)
+        assert query is not None, "Query must be provided for multimodal compression"
         
-        compressed_feats = self.token_learner(video_feats, query)
-        
-        # 若需返回注意力权重（需修改MultimodalTokenLearner以暴露权重）
-        weights = None  # 可自行实现
-        return compressed_feats, weights
+        compressed_feats = self.token_learner(Fv, query, mask, query_mask)
+        # 创建压缩后的掩码，形状为 (batch_size, compress_len)，全为True
+        compress_mask = torch.ones((Fv.shape[0], self.compress_len), dtype=torch.bool, device=Fv.device)
+        return compressed_feats, compress_mask
 
 class MultimodalTokenLearner(nn.Module):
     def __init__(self, hidden_dim, num_tokens, num_heads, dropout):
         super().__init__()
         self.num_tokens = num_tokens
         self.hidden_dim = hidden_dim
-
         self.build_tokenlearner(hidden_dim, num_tokens, dropout)
 
     def build_tokenlearner(self, hidden_dim, num_tokens, dropout):
@@ -430,32 +427,48 @@ class MultimodalTokenLearner(nn.Module):
 
         self.norm = nn.LayerNorm(hidden_dim, elementwise_affine=False)
 
-    def tokenlearner(self, input, query):
-        # [B, T, h]
-        selected = self.input_mlp(input)
-        # [B, T, n]
-        selected = selected.transpose(1, 2)
-        selected = F.softmax(selected, -1)
-        # [B, n, T] 
-        feat_selected = torch.einsum('...nt,...td->...nd', selected, input)
-        # [B, n, h]
 
-        query = query.mean(1, keepdim=True)
-        # [B, T, h] [B, 1, h]
-        attn = self.fc_feat(input) + self.fc_query(query)
-        # [B, T, h]
-        attn = self.w(attn).transpose(1, 2)
-        attn = F.softmax(attn, dim=-1)
-        # [B, n, T]
-        feat_query = torch.einsum('...nt,...td->...nd', attn, input)
-        # [B, n, h]
+    def tokenlearner(self, input, query, input_mask=None, query_mask=None):
+        """Args:
+            input:  [B, T, h] 视频特征
+            query:  [B, q_len, h] 查询特征
+            input_mask: [B, T]
+            query_mask: [B, q_len]
+        """
+        # --- 视觉TokenLearner分支 ---
+        selected = self.input_mlp(input)  # [B, T, n]
+        selected = selected.transpose(1, 2)  # [B, n, T]
+        
+        # 应用掩码：将无效位置的权重设为负无穷
+        if input_mask is not None:
+            input_mask = input_mask.unsqueeze(1)  # [B, 1, T]
+            selected = selected.masked_fill(~input_mask.bool(), -1e9)
+        
+        selected = F.softmax(selected, dim=-1)  # [B, n, T]
+        feat_selected = torch.einsum('...nt,...td->...nd', selected, input)  # [B, n, h]
 
+        # --- 语言引导分支 ---
+        if query_mask is not None:
+            query = (query * query_mask.unsqueeze(-1)).sum(dim=1, keepdim=True) / \
+                    query_mask.sum(dim=1, keepdim=True).clamp(min=1e-6).unsqueeze(-1)
+        else:
+            query = query.mean(dim=1, keepdim=True)  # [B, 1, h]
+        attn = self.fc_feat(input) + self.fc_query(query)  # [B, T, h]
+        attn = self.w(attn).transpose(1, 2)  # [B, n, T]
+        
+        # 应用掩码（同上）
+        if input_mask is not None:
+            attn = attn.masked_fill(~input_mask.bool(), -1e9)
+        
+        attn = F.softmax(attn, dim=-1)  # [B, n, T]
+        feat_query = torch.einsum('...nt,...td->...nd', attn, input)  # [B, n, h]
+
+        # --- 融合 ---
         feat = self.norm(
             self.video_gate(input.mean(1, keepdim=True)) * feat_selected + 
-            self.query_gate(query) * feat_query)
-        
+            self.query_gate(query) * feat_query
+        )
         return feat
 
-    def forward(self, input, query):
-        feat = self.tokenlearner(input, query)
-        return feat
+    def forward(self, input, query, mask=None, query_mask=None):
+        return self.tokenlearner(input, query, mask, query_mask)

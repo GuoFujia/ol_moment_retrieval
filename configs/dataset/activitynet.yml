@@ -5,6 +5,7 @@ eval_path:  /home/gfj/lighthouse-main/data/activitynet/activitynet_val_release.j
 
 short_memory_len : 8
 long_memory_sample_len: 64
+# long_memory_sample_len: 16
 future_memory_sample_len: 0
 
 max_v_l: -1

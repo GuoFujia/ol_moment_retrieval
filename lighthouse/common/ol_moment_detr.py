@@ -64,6 +64,7 @@ class OLMomentDETR(nn.Module):
         self.use_vid_compression = use_vid_compression
         if self.use_vid_compression:
             self.memory_compressor = VideoMemoryCompressorWithExternalWeights(hidden_dim, compress_len=compress_len)
+            # self.memory_compressor = MultimodalTokenCompressor(hidden_dim, compress_len=compress_len)
             # self.text_guided_video_attention = TextGuidedVideoAttention(t_dim = hidden_dim,v_dim = hidden_dim,hidden_dim = hidden_dim)
 
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
@@ -142,6 +143,17 @@ class OLMomentDETR(nn.Module):
         long_vid = src_vid[:, :memory_len[0]]
         long_vid_mask = src_vid_mask[:, :memory_len[0]]
 
+        # # 逐个样本的检查mask
+        # flag = 1
+        # for i in range(long_vid_mask.shape[0]):
+        #     if(long_vid_mask[i][0]!=0): 
+        #         print("long_vid_mask[", i, "]:\n", long_vid_mask[i])
+        #         print("src_txt_mask[", i, "]:\n", src_txt_mask[i])
+        #         flag = input("1 to continue, 0 to exit")
+        #         if flag == '0':
+        #             break
+            
+
         # 压缩长期记忆
         if self.use_vid_compression:
             # 如果是train，使用数据集提供的mid分数作为extern_weight
@@ -174,14 +186,31 @@ class OLMomentDETR(nn.Module):
                 extern_weight = extern_weight.to(long_vid.device)
 
             # long_vid = self.text_guided_video_attention(Ft = src_txt, Fv = long_vid, vid_mask = long_vid_mask, text_mask = src_txt_mask)
-            # compress_long_vid, compress_long_mask, combined_weights_single = self.memory_compressor(long_vid, mask=long_vid_mask, extern_weight=extern_weight)
-            compress_long_vid, compress_long_mask, combined_weights_single = self.memory_compressor(long_vid, mask=long_vid_mask, extern_weight=None)
-            
+            # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, mask=long_vid_mask, extern_weight=extern_weight)
+            compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, mask=long_vid_mask)
+            # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, mask=long_vid_mask, query=src_txt, query_mask=src_txt_mask)
+            if torch.isnan(compress_long_vid).any():
+                print("compress_long_vid contains NaN!")
+                print("long_vid:", long_vid)
+                print("src_txt:", src_txt)
+                print("src_txt_mask:", src_txt_mask)
+                print("long_vid_mask:", long_vid_mask)
+                print("extern_weight:", extern_weight)
+                input("Press Enter to continue...")
+
             #   将压缩后的长期记忆和短期，future记忆拼接得到新的src_vid, src_vid_mask
             src_vid, src_vid_mask = torch.cat([compress_long_vid, src_vid[:, memory_len[0]:]], dim=1), \
                 torch.cat([compress_long_mask, src_vid_mask[:, memory_len[0]:]], dim=1)
             memory_len[0] = self.compress_len
             # print("after compress, src_vid shape and src_vid_mask shape:", src_vid.shape, src_vid_mask.shape)
+            # # 逐个样本的查看mask
+            # flag = 1
+            # for i in range(src_vid_mask.shape[0]):
+            #     print("src_vid_mask[", i, "]:\n", src_vid_mask[i])
+            #     print("src_txt_mask[", i, "]:\n", src_txt_mask[i])
+            #     flag = input("1 to continue, 0 to exit")
+            #     if flag == '0':
+            #         break
 
         #   拼接视频和文本的特征，掩码
         src = torch.cat([src_vid, src_txt], dim=1)  # (bsz, L_vid+L_txt, d)
@@ -232,7 +261,6 @@ class OLMomentDETR(nn.Module):
 
         # 维护和更新mid_label_dict的逻辑
         if self.use_vid_compression and not self.training and qid_vid is not None and short_memory_start is not None:
-            # 确保qid_vid和short_memory_start是CPU上的标量
             qid_vid_list = qid_vid # 转换为Python列表
             short_memory_start_list = short_memory_start
             batch_size = src_vid.shape[0]

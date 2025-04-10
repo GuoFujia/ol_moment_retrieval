@@ -172,8 +172,8 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
 
     train_loader = DataLoader(
         train_dataset,
-        # collate_fn=lambda batch: start_end_collate_ol(batch, long_memory_sample_length=train_dataset.long_memory_sample_length),
-        collate_fn = start_end_collate_ol,
+        collate_fn=lambda batch: start_end_collate_ol(batch, long_memory_sample_length=train_dataset.long_memory_sample_length),
+        # collate_fn = start_end_collate_ol,
         batch_size=opt.bsz,
         num_workers=opt.num_workers,
         shuffle=True,

@@ -3,12 +3,12 @@ clip_length: 2
 train_path: /home/gfj/lighthouse-main/data/qvhighlight/highlight_train_release.jsonl
 eval_path: /home/gfj/lighthouse-main/data/qvhighlight/highlight_val_release.jsonl
 
-use_vid_compression: False
+use_vid_compression: True
 
 short_memory_len : 8
-# long_memory_sample_len: 64
-long_memory_sample_len: 16
+long_memory_sample_len: 64
+# long_memory_sample_len: 16
 future_memory_sample_len: 0
 
-# compress_len: 16
-compress_len: 64
+compress_len: 16
+# compress_len: 64
