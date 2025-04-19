@@ -307,8 +307,8 @@ def eval_epoch(epoch_i, model, eval_dataset, opt, save_submission_filename, crit
         shuffle=False,
     )
 
-    # reset mid_label_dict
-    model.reset_mid_label_dict()
+    # reset saliency_score_dict
+    model.reset_saliency_score_dict()
 
     # if opt.dset_name == 'tvsum' or opt.dset_name == 'youtube_highlight':
     #     metrics, eval_loss_meters = compute_hl_results(epoch_i, model, eval_loader, opt, criterion)

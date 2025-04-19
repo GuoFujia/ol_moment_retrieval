@@ -8,6 +8,8 @@ long_memory_sample_len: 64
 # long_memory_sample_len: 16
 future_memory_sample_len: 0
 
+lr: 0.0005 # 0.0001-> AdamW，和bsz等比例调整
+# lr_drop: 40
 max_v_l: -1
 max_q_l: 100
 # max_v_l: 500

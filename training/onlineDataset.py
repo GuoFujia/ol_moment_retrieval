@@ -550,11 +550,11 @@ class StartEndDataset(Dataset):
         """获取数据样本
         如果标签无效，返回None，在collate_fn中会被过滤掉
         """
-        # if self.test_mode:
-        #     chunk_info = self.chunk_infos[self.sample_seq[idx]]
-        # else:
-        #     chunk_info = self.chunk_infos[idx]
-        chunk_info = self.chunk_infos[self.sample_seq[idx]]
+        if self.test_mode:
+            chunk_info = self.chunk_infos[self.sample_seq[idx]]
+        else:
+            chunk_info = self.chunk_infos[idx]
+        # chunk_info = self.chunk_infos[self.sample_seq[idx]]
         # chunk_info = self.chunk_infos[idx]
     
         
@@ -599,16 +599,34 @@ class StartEndDataset(Dataset):
             # if self.long_memory_sample_length > 0:
             model_inputs["video_feat_long"]=whole_video_feature[long_memory_start:long_memory_end:self.long_memory_stride]  
             ctx_l_long=len(model_inputs["video_feat_long"])
-            if not self.test_mode:
-                # 从 mid_label_dict 获取权重
-                vid, qid = chunk_info['vid'], chunk_info['qid']
-                mid_labels = self.mid_label_dict[(vid, qid)]
-                # 截取对应区间并下采样
-                long_memory_weights = mid_labels[long_memory_start:long_memory_end:self.long_memory_stride]
-                model_inputs["long_memory_weight"] = torch.tensor(long_memory_weights)
-            else:
-                model_inputs["qid_vid"] = [chunk_info['qid'], chunk_info['vid']]
-                model_inputs["short_memory_start"] = short_memory_start
+            # if not self.test_mode:
+            #     # 从 mid_label_dict 获取权重
+            #     vid, qid = chunk_info['vid'], chunk_info['qid']
+            #     # 截取对应区间并下采样
+            #     # 实现1：将mid_label作为权重
+            #     # long_memory_weights = mid_labels[long_memory_start:long_memory_end:self.long_memory_stride]
+            #     # 实现2：将显著性分数作为权重
+            #     long_memory_weights = self.saliency_scores_list[(vid, qid)][long_memory_start:long_memory_end:self.long_memory_stride]
+            #     if self.dset_name == "qvhighlight" and len(long_memory_weights) > 0 :
+            #         # 当long_memory_weights长度不为0时，将显著性分数归一化到0-1
+            #         long_memory_weights = long_memory_weights / 4
+            #     model_inputs["long_memory_weight"] = torch.tensor(long_memory_weights)
+            # else:
+            #     model_inputs["qid_vid"] = [chunk_info['qid'], chunk_info['vid']]
+            #     model_inputs["short_memory_start"] = short_memory_start
+
+            # train/val均从数据集获得外部权重，评估upbound
+            # 从 mid_label_dict 获取权重
+            vid, qid = chunk_info['vid'], chunk_info['qid']
+            # 截取对应区间并下采样
+            # 实现1：将mid_label作为权重
+            # long_memory_weights = mid_labels[long_memory_start:long_memory_end:self.long_memory_stride]
+            # 实现2：将显著性分数作为权重
+            long_memory_weights = self.saliency_scores_list[(vid, qid)][long_memory_start:long_memory_end:self.long_memory_stride]
+            if self.dset_name == "qvhighlight" and len(long_memory_weights) > 0 :
+                # 当long_memory_weights长度不为0时，将显著性分数归一化到0-1
+                long_memory_weights = long_memory_weights / 4
+            model_inputs["long_memory_weight"] = torch.tensor(long_memory_weights)
 
 
 

@@ -12,14 +12,15 @@ from lighthouse.common.moment_transformer import build_transformer
 from lighthouse.common.position_encoding import build_position_encoding
 from lighthouse.common.utils.span_utils import temporal_iou, generalized_temporal_iou, span_cxw_to_xx
 from lighthouse.common.compressor import MultimodalTokenCompressor
-from lighthouse.common.compressor import VideoMemoryCompressorWithExternalWeights, TextGuidedVideoAttention
+from lighthouse.common.compressor import SimpleCompressor, TextGuidedCompressor, CompressorWithExternalWeights, CompressorWithWeightedKV, CompressorWithPostWeighting, CompressorWithSmoothMechanism
+
 
 class OLMomentDETR(nn.Module):
     """ This is the Moment-DETR module that performs moment localization. """
 
     def __init__(self, transformer, position_embed, txt_position_embed, txt_dim, vid_dim,
                  num_queries, input_dropout, aux_loss=False, max_v_l=75, span_loss_type="l1", 
-                 use_txt_pos=False, n_input_proj=2, aud_dim=0, compress_len=10, use_vid_compression=True):
+                 use_txt_pos=False, n_input_proj=2, aud_dim=0, compress_len=10, use_vid_compression=True, weight_alpha=0.5):
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture. See transformer.py
@@ -50,11 +51,11 @@ class OLMomentDETR(nn.Module):
         self.saliency_proj = nn.Linear(hidden_dim, 1)
         self.compress_len = compress_len
 
-        # 一个字典，记录每个[qid_vid]对对应的视频的mid_label标签值
-        # 用mid_label_dict[qid_vid]可以快速访问
-        # mid_label_dict结构：每个[qid_vid]索引两个元素：1.start：当前vid对于qid从start·开始采样；
-        #                                              2.score：二维float数组，score[i][j]代表从start开始的第i帧的第j个预测mid_label
-        self.mid_label_dict = {}
+        # 一个字典，记录每个[qid_vid]对对应的视频的显著性分数值
+        # 用saliency_score_dict[qid_vid]可以快速访问
+        # saliency_score_dict结构：每个[qid_vid]索引两个元素：1.start：当前vid对于qid从start·开始采样；
+        #                                              2.score：二维float数组，score[i][j]代表从start开始的第i帧的第j个预测saliency_score
+        self.saliency_score_dict = {}
 
         self.use_txt_pos = use_txt_pos
         self.n_input_proj = n_input_proj
@@ -63,9 +64,13 @@ class OLMomentDETR(nn.Module):
 
         self.use_vid_compression = use_vid_compression
         if self.use_vid_compression:
-            self.memory_compressor = VideoMemoryCompressorWithExternalWeights(hidden_dim, compress_len=compress_len)
+            # self.memory_compressor = TextGuidedCompressor(t_dim = hidden_dim,v_dim = hidden_dim,hidden_dim = hidden_dim,compress_len=self.compress_len,weight_alpha=weight_alpha)
+            self.memory_compressor =CompressorWithExternalWeights(hidden_dim, compress_len=compress_len, weight_alpha=weight_alpha)
             # self.memory_compressor = MultimodalTokenCompressor(hidden_dim, compress_len=compress_len)
             # self.text_guided_video_attention = TextGuidedVideoAttention(t_dim = hidden_dim,v_dim = hidden_dim,hidden_dim = hidden_dim)
+            # self.memory_compressor = CompressorWithSmoothMechanism(hidden_dim, compress_len=compress_len)
+            # self.memory_compressor = CompressorWithWeightedKV(hidden_dim, compress_len=self.compress_len)
+            # self.memory_compressor = CompressorWithPostWeighting(hidden_dim, compress_len=self.compress_len)
 
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         relu_args = [True] * 3
@@ -83,10 +88,6 @@ class OLMomentDETR(nn.Module):
 
         self.aux_loss = aux_loss
 
-    # def set_mid_label_dict(self, mid_label_dict):
-    #     self.mid_label_dict = mid_label_dict
-    #     print("Mid label dict set in model, len of mid_label_dict: {}".format(len(mid_label_dict)))
-
     def forward(self, src_txt, src_txt_mask, src_vid, memory_len, src_vid_mask, chunk_idx, src_aud=None, src_aud_mask=None,
                 long_memory_weight=None, qid_vid=None, short_memory_start=None):
         """
@@ -98,8 +99,8 @@ class OLMomentDETR(nn.Module):
                 - src_vid_mask: [batch_size, L_vid]
                 -memory_len: [], 三种记忆的采样长度
                 -long_memory_weight: [batch_size, L_vid],在train的时候使用,用于提供extern_weight
-                -qid_vid: [batch_size,],在eval/val的时候使用的，用于将样本和mid_label_dict中的标签匹配
-        返回值为包含以下内容的dict:
+                    -qid_vid: [batch_size,],在eval/val的时候使用的，用于将样本和saliency_score_dict中的标签匹配
+            返回值为包含以下内容的dict:
                 -"pred_spans": The normalized boxes coordinates for all queries, represented as
                                (center_x, width). These values are normalized in [0, 1],
                                relative to the size of each individual image (disregarding possible padding).
@@ -156,39 +157,54 @@ class OLMomentDETR(nn.Module):
 
         # 压缩长期记忆
         if self.use_vid_compression:
-            # 如果是train，使用数据集提供的mid分数作为extern_weight
-            if self.training:
-                extern_weight = long_memory_weight
-            else: # inference时，使用过去推理的mid结果
-                all_weights = []
-                extern_weight = None  # 显式初始化
+            # 训练/val均使用数据集提供的显著性分数作为extern_weight，验证方法的upbound
+            extern_weight = long_memory_weight
 
-                for batch_idx in range(len(qid_vid)):
-                    output = self.get_long_memory_weight_by_qid_vid(qid_vid[batch_idx][0], qid_vid[batch_idx][1])
+            # # 如果是train，使用数据集提供的mid分数作为extern_weight
+            # if self.training:
+            #     extern_weight = long_memory_weight
+            # else: # inference时，使用过去推理的mid结果
+            #     all_weights = []
+            #     extern_weight = None  # 显式初始化
+
+            #     for batch_idx in range(len(qid_vid)):
+            #         output = self.get_long_memory_weight_by_qid_vid(qid_vid[batch_idx][0], qid_vid[batch_idx][1])
                     
-                    if output is None:
-                        # print(f"No long memory weight found for qid {qid_vid[batch_idx][0]} and vid {qid_vid[batch_idx][1]}")
-                        # 清空已收集的权重，确保一致性
-                        all_weights = []  
-                        extern_weight = None
-                        break
-                    indexed_weight = self.index_weight(output[1], output[0], short_memory_start[batch_idx], memory_len[0])
-                    all_weights.append(torch.from_numpy(indexed_weight).float())
+            #         if output is None:
+            #             # print(f"No long memory weight found for qid {qid_vid[batch_idx][0]} and vid {qid_vid[batch_idx][1]}")
+            #             # 清空已收集的权重，确保一致性
+            #             all_weights = []  
+            #             extern_weight = None
+            #             break
+            #         indexed_weight = self.index_weight(output[1], output[0], short_memory_start[batch_idx], memory_len[0])
+            #         all_weights.append(torch.from_numpy(indexed_weight).float())
 
-                # 只有在所有batch都成功获取权重时才stack
-                if len(all_weights) == len(qid_vid):
-                    extern_weight = torch.stack(all_weights, dim=0)
-                else:
-                    extern_weight = None
+            #     # 只有在所有batch都成功获取权重时才stack
+            #     if len(all_weights) == len(qid_vid):
+            #         extern_weight = torch.stack(all_weights, dim=0)
+            #     else:
+            #         extern_weight = None
                     
             # 确保extern_weight在和long_vid在相同的设备上
             if extern_weight is not None:
                 extern_weight = extern_weight.to(long_vid.device)
 
+            if torch.isnan(long_vid).any():
+                print("long_vid contains NaN!")
+
             # long_vid = self.text_guided_video_attention(Ft = src_txt, Fv = long_vid, vid_mask = long_vid_mask, text_mask = src_txt_mask)
-            # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, mask=long_vid_mask, extern_weight=extern_weight)
-            compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, mask=long_vid_mask)
+            compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, mask=long_vid_mask, extern_weight=extern_weight)
+            # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, mask=long_vid_mask)
             # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, mask=long_vid_mask, query=src_txt, query_mask=src_txt_mask)
+            # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, vid_mask=long_vid_mask, Ft=src_txt, text_mask=src_txt_mask)
+            # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, vid_mask=long_vid_mask, Ft=src_txt, text_mask=src_txt_mask,extern_weight=extern_weight)
+
+            # print("shape of compress_long_vid:", compress_long_vid.shape)
+            # print("shape of compress_long_mask:", compress_long_mask.shape)
+            # print("compress_long_vid:", compress_long_vid)
+            # print("compress_long_mask:", compress_long_mask)
+            # input("Press Enter to continue...")
+
             if torch.isnan(compress_long_vid).any():
                 print("compress_long_vid contains NaN!")
                 print("long_vid:", long_vid)
@@ -259,7 +275,7 @@ class OLMomentDETR(nn.Module):
         # 添加 chunk_idx 到输出
         out["chunk_idx"] = chunk_idx  # [batch_size]
 
-        # 维护和更新mid_label_dict的逻辑
+        # 维护和更新saliency_score_dict的逻辑
         if self.use_vid_compression and not self.training and qid_vid is not None and short_memory_start is not None:
             qid_vid_list = qid_vid # 转换为Python列表
             short_memory_start_list = short_memory_start
@@ -268,23 +284,21 @@ class OLMomentDETR(nn.Module):
             for i in range(batch_size):
                 qid,vid = qid_vid_list[i]
                 current_short_start = short_memory_start_list[i]
-                current_frame_pred = out['frame_pred'][i, :, 1]  # 提取mid标签logits
-                # 将预测结果转化为概率值
-                current_frame_pred = torch.sigmoid(current_frame_pred)
-                current_length = current_frame_pred.size(0)
-                current_frame_pred_np = current_frame_pred.cpu().detach().numpy()
+                current_saliency_score = out["saliency_scores"][i, :]
+                current_length = current_saliency_score.size(0)
+                current_saliency_score_np = current_saliency_score.cpu().detach().numpy()
 
-                if (qid,vid) not in self.mid_label_dict:
+                if (qid,vid) not in self.saliency_score_dict:
                     # 初始化新条目
                     weight = np.full((current_length, memory_len[1]), np.nan)
                     # 将当前预测结果填充到weight中
-                    weight[:current_length, 0] = current_frame_pred_np
-                    self.mid_label_dict[(qid,vid)] = {
+                    weight[:current_length, 0] = current_saliency_score_np
+                    self.saliency_score_dict[(qid,vid)] = {
                         'start': current_short_start,
                         'weight': weight
                     }
                 else:
-                    entry = self.mid_label_dict[(qid,vid)]
+                    entry = self.saliency_score_dict[(qid,vid)]
                     existing_start = entry['start']
                     existing_weight = entry['weight']
                     new_L = current_short_start - existing_start + current_length
@@ -292,27 +306,34 @@ class OLMomentDETR(nn.Module):
                     # 将existing_weight复制到new_weight
                     new_weight[:existing_weight.shape[0], :memory_len[1]] = existing_weight
                     # 将现有数据复制到新数组
-                    for i, mid_label in enumerate(current_frame_pred_np):
+                    for i, saliency_score in enumerate(current_saliency_score_np):
                         for insert_idx, latest_label in enumerate(new_weight[current_short_start + i - existing_start]):
                             if np.isnan(latest_label) :
-                                new_weight[current_short_start + i - existing_start, insert_idx] = mid_label
+
+                                if np.isnan(saliency_score):
+                                    input("nan occur in saliency score")
+
+                                new_weight[current_short_start + i - existing_start, insert_idx] = saliency_score
                                 break
                     # 更新条目
                     entry['weight'] = new_weight
+
+                    # print("new_weight:", new_weight)
+                    # input("press enter to continue...")
         return out
 
-    def reset_mid_label_dict(self):
-        self.mid_label_dict = {}
+    def reset_saliency_score_dict(self):
+        self.saliency_score_dict = {}
 
     def process_probs_by_avg(self,probs):
         return np.mean(probs, axis=0)
 
-    # 通过mid_label_dict获取long memory的weight
+    # 通过saliency_score_dict获取long memory的weight
     # 返回值:1.startl2.从start开始的全部的long_memory_weight,形状为(batch_size, long_memory_length)
     def get_long_memory_weight_by_qid_vid(self,qid,vid):
-        if (qid,vid) not in self.mid_label_dict:
+        if (qid,vid) not in self.saliency_score_dict:
             return None
-        dict = self.mid_label_dict[(qid,vid)]
+        dict = self.saliency_score_dict[(qid,vid)]
         dict_weight = dict["weight"]
         res = []
         for frame in dict_weight:
@@ -323,11 +344,24 @@ class OLMomentDETR(nn.Module):
             # print("frame:", frame)
             # print("dict_weight:", dict_weight)
             # print("dict_start:", dict_start)
-            # print("dict:", self.mid_label_dict[(qid,vid)])
+            # print("dict:", self.saliency_score_dict[(qid,vid)])
             # input("press enter to continue...")
 
             valid_frame = frame[~np.isnan(frame)]
+
+            if np.isnan(valid_frame).any():
+                input("all nan occur in valid_frame")
+
             frame_weight = self.process_probs_by_avg(valid_frame)
+            # 对于每一帧的权重，归一化到0-1
+            # 如果是qv数据集，先把分数缩放
+            if ".0" in vid:
+                frame_weight = frame_weight / 4
+            if frame_weight > 1:
+                frame_weight = 1
+            if frame_weight < 0:
+                frame_weight = 0
+                
             res.append(frame_weight)
         return dict["start"], np.array(res)
     # 从get_long_memory_weight_by_qid_vid返回的weight_list中获取[st,ed]之间的分数
@@ -805,7 +839,8 @@ def build_model(args):
         span_loss_type=args.span_loss_type,
         n_input_proj=args.n_input_proj,
         compress_len=args.compress_len,
-        use_vid_compression=args.use_vid_compression
+        use_vid_compression=args.use_vid_compression,
+        weight_alpha=args.weight_alpha
     )
 
     matcher = build_matcher(args)

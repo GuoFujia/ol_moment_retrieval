@@ -6,6 +6,7 @@ num_workers: 0
 # long_memory_sample_len: 32
 # future_memory_sample_len: 0
 
+weight_alpha: 0.5
 
 lr: 0.0008 # 0.0001-> AdamW，和bsz等比例调整
 lr_drop: 100  # 400 按照epoch比例调整  
