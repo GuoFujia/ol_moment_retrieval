@@ -15,6 +15,8 @@ max_q_l: 100
 # max_v_l: 500
 # max_q_l: 100
 
+# eval_epoch_interval: 2
+
 use_vid_compression: True
 
 compress_len: 16

@@ -12,7 +12,7 @@ from lighthouse.common.moment_transformer import build_transformer
 from lighthouse.common.position_encoding import build_position_encoding
 from lighthouse.common.utils.span_utils import temporal_iou, generalized_temporal_iou, span_cxw_to_xx
 from lighthouse.common.compressor import MultimodalTokenCompressor
-from lighthouse.common.compressor import SimpleCompressor, TextGuidedCompressor, CompressorWithExternalWeights, CompressorWithWeightedKV, CompressorWithPostWeighting, CompressorWithSmoothMechanism
+from lighthouse.common.compressor import SimpleCompressor, TextGuidedCompressor, CompressorWithExternalWeights, CompressorWithWeightedKV, CompressorWithPostWeighting, CompressorWithSmoothMechanism, ResidualCompressor, CrossAttentionResidualCompressor, CompressorWithPositionWeights, CrossAttentionResidualCompressorWithQuery
 
 
 class OLMomentDETR(nn.Module):
@@ -65,12 +65,16 @@ class OLMomentDETR(nn.Module):
         self.use_vid_compression = use_vid_compression
         if self.use_vid_compression:
             # self.memory_compressor = TextGuidedCompressor(t_dim = hidden_dim,v_dim = hidden_dim,hidden_dim = hidden_dim,compress_len=self.compress_len,weight_alpha=weight_alpha)
-            self.memory_compressor =CompressorWithExternalWeights(hidden_dim, compress_len=compress_len, weight_alpha=weight_alpha)
+            # self.memory_compressor =CompressorWithExternalWeights(hidden_dim, compress_len=compress_len, weight_alpha=weight_alpha)
             # self.memory_compressor = MultimodalTokenCompressor(hidden_dim, compress_len=compress_len)
             # self.text_guided_video_attention = TextGuidedVideoAttention(t_dim = hidden_dim,v_dim = hidden_dim,hidden_dim = hidden_dim)
             # self.memory_compressor = CompressorWithSmoothMechanism(hidden_dim, compress_len=compress_len)
             # self.memory_compressor = CompressorWithWeightedKV(hidden_dim, compress_len=self.compress_len)
             # self.memory_compressor = CompressorWithPostWeighting(hidden_dim, compress_len=self.compress_len)
+            # self.memory_compressor = ResidualCompressor(dimension=hidden_dim, compress_len=self.compress_len, weight_alpha=weight_alpha)
+            # self.memory_compressor = CrossAttentionResidualCompressor(dimension=hidden_dim, compress_len=self.compress_len, weight_alpha=weight_alpha)
+            self.memory_compressor = CrossAttentionResidualCompressorWithQuery(dimension=hidden_dim, compress_len=self.compress_len, weight_alpha=weight_alpha, attn_weight=0.3)
+            # self.memory_compressor = CompressorWithPositionWeights(dimension=hidden_dim, compress_len=self.compress_len)
 
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         relu_args = [True] * 3
@@ -158,32 +162,32 @@ class OLMomentDETR(nn.Module):
         # 压缩长期记忆
         if self.use_vid_compression:
             # 训练/val均使用数据集提供的显著性分数作为extern_weight，验证方法的upbound
-            extern_weight = long_memory_weight
+            # extern_weight = long_memory_weight
 
-            # # 如果是train，使用数据集提供的mid分数作为extern_weight
-            # if self.training:
-            #     extern_weight = long_memory_weight
-            # else: # inference时，使用过去推理的mid结果
-            #     all_weights = []
-            #     extern_weight = None  # 显式初始化
+            # 如果是train，使用数据集提供的mid分数作为extern_weight
+            if self.training:
+                extern_weight = long_memory_weight
+            else: # inference时，使用过去推理的mid结果
+                all_weights = []
+                extern_weight = None  # 显式初始化
 
-            #     for batch_idx in range(len(qid_vid)):
-            #         output = self.get_long_memory_weight_by_qid_vid(qid_vid[batch_idx][0], qid_vid[batch_idx][1])
+                for batch_idx in range(len(qid_vid)):
+                    output = self.get_long_memory_weight_by_qid_vid(qid_vid[batch_idx][0], qid_vid[batch_idx][1])
                     
-            #         if output is None:
-            #             # print(f"No long memory weight found for qid {qid_vid[batch_idx][0]} and vid {qid_vid[batch_idx][1]}")
-            #             # 清空已收集的权重，确保一致性
-            #             all_weights = []  
-            #             extern_weight = None
-            #             break
-            #         indexed_weight = self.index_weight(output[1], output[0], short_memory_start[batch_idx], memory_len[0])
-            #         all_weights.append(torch.from_numpy(indexed_weight).float())
+                    if output is None:
+                        # print(f"No long memory weight found for qid {qid_vid[batch_idx][0]} and vid {qid_vid[batch_idx][1]}")
+                        # 清空已收集的权重，确保一致性
+                        all_weights = []  
+                        extern_weight = None
+                        break
+                    indexed_weight = self.index_weight(output[1], output[0], short_memory_start[batch_idx], memory_len[0])
+                    all_weights.append(torch.from_numpy(indexed_weight).float())
 
-            #     # 只有在所有batch都成功获取权重时才stack
-            #     if len(all_weights) == len(qid_vid):
-            #         extern_weight = torch.stack(all_weights, dim=0)
-            #     else:
-            #         extern_weight = None
+                # 只有在所有batch都成功获取权重时才stack
+                if len(all_weights) == len(qid_vid):
+                    extern_weight = torch.stack(all_weights, dim=0)
+                else:
+                    extern_weight = None
                     
             # 确保extern_weight在和long_vid在相同的设备上
             if extern_weight is not None:
@@ -193,11 +197,11 @@ class OLMomentDETR(nn.Module):
                 print("long_vid contains NaN!")
 
             # long_vid = self.text_guided_video_attention(Ft = src_txt, Fv = long_vid, vid_mask = long_vid_mask, text_mask = src_txt_mask)
-            compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, mask=long_vid_mask, extern_weight=extern_weight)
+            # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, mask=long_vid_mask, extern_weight=extern_weight)
             # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, mask=long_vid_mask)
             # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, mask=long_vid_mask, query=src_txt, query_mask=src_txt_mask)
             # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, vid_mask=long_vid_mask, Ft=src_txt, text_mask=src_txt_mask)
-            # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, vid_mask=long_vid_mask, Ft=src_txt, text_mask=src_txt_mask,extern_weight=extern_weight)
+            compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, vid_mask=long_vid_mask, Ft=src_txt, text_mask=src_txt_mask,extern_weight=extern_weight)
 
             # print("shape of compress_long_vid:", compress_long_vid.shape)
             # print("shape of compress_long_mask:", compress_long_mask.shape)
@@ -288,9 +292,10 @@ class OLMomentDETR(nn.Module):
                 current_length = current_saliency_score.size(0)
                 current_saliency_score_np = current_saliency_score.cpu().detach().numpy()
 
+                weight_col = 1 if self.training else memory_len[1]
                 if (qid,vid) not in self.saliency_score_dict:
                     # 初始化新条目
-                    weight = np.full((current_length, memory_len[1]), np.nan)
+                    weight = np.full((current_length, weight_col), np.nan)
                     # 将当前预测结果填充到weight中
                     weight[:current_length, 0] = current_saliency_score_np
                     self.saliency_score_dict[(qid,vid)] = {
@@ -302,9 +307,14 @@ class OLMomentDETR(nn.Module):
                     existing_start = entry['start']
                     existing_weight = entry['weight']
                     new_L = current_short_start - existing_start + current_length
-                    new_weight = np.full((new_L, memory_len[1]), np.nan)
+                    new_weight = np.full((new_L, weight_col), np.nan)
                     # 将existing_weight复制到new_weight
-                    new_weight[:existing_weight.shape[0], :memory_len[1]] = existing_weight
+
+                    # print("existing_weight:", existing_weight)
+                    # print("new_weight:", new_weight)
+                    # input("press enter to continue...")
+
+                    new_weight[:existing_weight.shape[0], :weight_col] = existing_weight
                     # 将现有数据复制到新数组
                     for i, saliency_score in enumerate(current_saliency_score_np):
                         for insert_idx, latest_label in enumerate(new_weight[current_short_start + i - existing_start]):

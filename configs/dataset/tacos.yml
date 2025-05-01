@@ -17,7 +17,7 @@ lw_saliency: 4
 lr: 0.0005  #0.0002
 lr_drop: 40
 
-eval_epoch_interval: 2
+# eval_epoch_interval: 2
 
 use_vid_compression: True
 

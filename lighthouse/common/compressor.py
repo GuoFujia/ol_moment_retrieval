@@ -312,6 +312,8 @@ class TextGuidedCompressor(nn.Module):
         """
         super().__init__()
 
+        self.compress_len = compress_len
+
         self.text_guided_video_attention = TextGuidedVideoAttention(
             t_dim=t_dim,
             v_dim=v_dim,
@@ -762,6 +764,275 @@ class CompressorWithExternalWeights(nn.Module):
         
         return Fv_compress, compress_mask
 
+# 0+. 加入位置权重的视频压缩模块，保留时序信息
+class CompressorWithPositionWeights(CompressorWithExternalWeights):
+    """
+    基于注意力机制的视频记忆压缩模块，融合外部权重和位置权重
+    
+    位置权重的目的是在压缩时保留视频特征之间的时序关系，
+    方法是为每个压缩后的特征位置设定"中心点"，
+    基于原始特征与这些中心点的距离计算position_weight
+    
+    输入:
+        Fv: 长期视频记忆特征，形状为 (batch_size, vid_len, dimension)
+        mask: 指示有效位置的掩码，形状为 (batch_size, vid_len)
+        extern_weight: 外部提供的权重，形状为 (batch_size, vid_len)
+        
+    输出:
+        Fv_compress: 压缩后的视频特征，形状为 (batch_size, compress_len, dimension)
+        compress_mask: 压缩后的有效掩码，形状为 (batch_size, compress_len)
+    """
+
+    def __init__(self, dimension, compress_len, num_heads=8, dropout=0.1, 
+                 attn_weight_alpha=0.33, extern_weight_alpha=0.33, position_weight_alpha=0.34):
+        """
+        初始化压缩模块
+        
+        参数:
+            dimension: 特征维度
+            compress_len: 压缩后的视频长度
+            num_heads: 多头注意力的头数
+            dropout: Dropout率
+            attn_weight_alpha: 注意力权重的融合系数
+            extern_weight_alpha: 外部权重的融合系数
+            position_weight_alpha: 位置权重的融合系数
+        """
+        # 调用父类初始化，但不使用父类的weight_alpha
+        super(CompressorWithPositionWeights, self).__init__(
+            dimension, compress_len, num_heads, dropout, weight_alpha=None)
+        
+        # 存储三种权重的融合系数
+        self.attn_weight_alpha = attn_weight_alpha
+        self.extern_weight_alpha = extern_weight_alpha
+        self.position_weight_alpha = position_weight_alpha
+        
+        # 检查权重和为1
+        total_alpha = attn_weight_alpha + extern_weight_alpha + position_weight_alpha
+        assert abs(total_alpha - 1.0) < 1e-5, f"权重和应为1，但得到了{total_alpha}"
+
+    def _get_valid_lengths(self, mask):
+        """
+        计算每个样本的有效长度
+        
+        参数:
+            mask: 有效位置的掩码，形状为 (batch_size, vid_len)
+            
+        返回:
+            valid_lengths: 每个样本的有效长度，形状为 (batch_size,)
+        """
+        if mask is None:
+            # 如果没有提供掩码，假设所有位置都有效
+            return torch.full((mask.size(0),), mask.size(1), device=mask.device)
+        else:
+            # 计算每个样本的有效位置数量
+            return mask.sum(dim=1).int()
+    
+    def _compute_position_weights(self, mask, batch_size, vid_len):
+        """
+        计算基于位置的权重
+        
+        参数:
+            mask: 有效位置的掩码，形状为 (batch_size, vid_len)
+            batch_size: 批次大小
+            vid_len: 视频长度
+            
+        返回:
+            position_weights: 位置权重，形状为 (batch_size, compress_len, vid_len)
+            need_compress: 指示每个样本是否需要压缩的掩码，形状为 (batch_size,)
+            original_indices: 对于不需要压缩的样本，原始特征的索引，形状为 (batch_size, compress_len)
+        """
+        device = mask.device if mask is not None else torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        
+        # 计算每个样本的有效长度
+        valid_lengths = self._get_valid_lengths(mask)
+        
+        # 确定哪些样本需要压缩（有效长度大于compress_len）
+        need_compress = valid_lengths > self.compress_len
+        
+        # 初始化位置权重和原始索引
+        position_weights = torch.zeros(batch_size, self.compress_len, vid_len, device=device)
+        original_indices = torch.zeros(batch_size, self.compress_len, dtype=torch.long, device=device)
+        
+        # 对每个样本计算位置权重
+        for i in range(batch_size):
+            if need_compress[i]:
+                # 样本需要压缩
+                valid_len = valid_lengths[i].item()
+                
+                # 在有效长度范围内找到有效位置的索引
+                if mask is not None:
+                    valid_indices = torch.nonzero(mask[i], as_tuple=True)[0]
+                else:
+                    valid_indices = torch.arange(valid_len, device=device)
+                
+                # 计算中心点（在有效特征中均匀分布）
+                # 例如，如果valid_len=10, compress_len=4，中心点将在索引 1.25, 3.75, 6.25, 8.75
+                # 取整后为 1, 4, 6, 9
+                centers = torch.linspace(0, valid_len - 1, self.compress_len, device=device)
+                centers = centers.round().long()
+                
+                # 从valid_indices中获取实际的中心点索引
+                center_indices = valid_indices[centers]
+                
+                # 为每个中心点计算到每个有效位置的距离权重
+                for j, center_idx in enumerate(center_indices):
+                    # 计算中心点到每个位置的归一化距离
+                    # 距离被归一化到[-1, 1]区间，中心点处为0
+                    if mask is not None:
+                        distances = torch.arange(vid_len, device=device)
+                        distances = (distances - center_idx) / valid_len
+                    else:
+                        distances = torch.arange(vid_len, device=device)
+                        distances = (distances - center_idx) / valid_len
+                    
+                    # 转换为权重 (1 - |distance|)，距离越近权重越大
+                    weights = 1.0 - torch.abs(distances)
+                    
+                    # 确保只有有效位置有权重
+                    if mask is not None:
+                        weights = weights * mask[i].float()
+                    
+                    # 存储权重
+                    position_weights[i, j] = weights
+            else:
+                # 样本不需要压缩，直接选择原始特征的前compress_len个
+                valid_len = valid_lengths[i].item()
+                
+                # 找到有效位置的索引
+                if mask is not None:
+                    valid_indices = torch.nonzero(mask[i], as_tuple=True)[0]
+                else:
+                    valid_indices = torch.arange(vid_len, device=device)
+                
+                # 选择前compress_len个有效位置（或者所有有效位置）
+                num_indices = min(valid_len, self.compress_len)
+                selected_indices = valid_indices[:num_indices]
+                
+                # 将选定的索引存储起来
+                original_indices[i, :num_indices] = selected_indices
+                
+                # 对选中的位置设置权重为1，其他位置为0
+                for j, idx in enumerate(selected_indices):
+                    position_weights[i, j, idx] = 1.0
+        
+        # 确保每行的权重和为1（对于有效权重）
+        # 避免除以0，添加一个小的epsilon
+        row_sums = position_weights.sum(dim=-1, keepdim=True)
+        position_weights = position_weights / (row_sums + 1e-9)
+        
+        return position_weights, need_compress, original_indices
+
+    def _weight_fusion(self, attn_weights, extern_weight, position_weights, mask, batch_size, vid_len):
+        """
+        融合注意力权重、外部权重和位置权重
+        
+        参数:
+            attn_weights: 注意力权重，形状为 (batch_size, num_heads, compress_len, vid_len)
+            extern_weight: 外部权重，形状为 (batch_size, vid_len)
+            position_weights: 位置权重，形状为 (batch_size, compress_len, vid_len)
+            mask: 有效位置的掩码，形状为 (batch_size, vid_len)
+            batch_size: 批次大小
+            vid_len: 视频长度
+            
+        返回:
+            final_weights: 融合后的权重，形状为 (batch_size, num_heads, compress_len, vid_len)
+        """
+        # 1. 处理外部权重
+        if extern_weight is not None:
+            # 确保extern_weight的形状正确
+            assert extern_weight.shape == (batch_size, vid_len), \
+                f"外部权重形状应为 {(batch_size, vid_len)}, 但得到了 {extern_weight.shape}"
+            
+            # 扩展外部权重以匹配压缩长度
+            # (batch_size, vid_len) -> (batch_size, compress_len, vid_len)
+            extern_weight_expanded = extern_weight.unsqueeze(1).expand(-1, self.compress_len, -1)
+            
+            # 应用掩码
+            if mask is not None:
+                mask_expanded = mask.unsqueeze(1)  # (batch_size, 1, vid_len)
+                extern_weight_expanded = extern_weight_expanded.masked_fill(~mask_expanded.bool(), 0)
+                
+                # 重新归一化外部权重
+                row_sums = extern_weight_expanded.sum(dim=-1, keepdim=True)
+                extern_weight_expanded = extern_weight_expanded / (row_sums + 1e-9)
+            
+            # 再次扩展以匹配多头
+            # (batch_size, compress_len, vid_len) -> (batch_size, 1, compress_len, vid_len)
+            extern_weight_expanded = extern_weight_expanded.unsqueeze(1)
+        else:
+            # 如果没有外部权重，设为0，不参与融合
+            extern_weight_expanded = torch.zeros_like(attn_weights)
+        
+        # 2. 处理位置权重
+        # (batch_size, compress_len, vid_len) -> (batch_size, 1, compress_len, vid_len)
+        position_weights_expanded = position_weights.unsqueeze(1)
+        
+        # 3. 融合三种权重
+        final_weights = (
+            self.attn_weight_alpha * attn_weights + 
+            self.extern_weight_alpha * extern_weight_expanded + 
+            self.position_weight_alpha * position_weights_expanded
+        )
+        
+        # 确保权重总和为1
+        final_weights_sum = final_weights.sum(dim=-1, keepdim=True)
+        final_weights = final_weights / (final_weights_sum + 1e-9)
+        
+        return final_weights
+
+    def forward(self, Fv, extern_weight=None, mask=None):
+        """
+        前向传播
+        
+        参数:
+            Fv: 长期视频记忆特征，形状为 (batch_size, vid_len, dimension)
+            extern_weight: 外部提供的权重，形状为 (batch_size, vid_len)
+            mask: 有效位置的掩码，形状为 (batch_size, vid_len)，True表示有效位置
+            
+        返回:
+            Fv_compress: 压缩后的视频特征，形状为 (batch_size, compress_len, dimension)
+            compress_mask: 压缩后的有效掩码，形状为 (batch_size, compress_len)
+        """
+        batch_size, vid_len, _ = Fv.size()
+        device = Fv.device
+        
+        # 1. 计算位置权重
+        position_weights, need_compress, original_indices = self._compute_position_weights(
+            mask, batch_size, vid_len)
+        
+        # 2. 对于需要压缩的样本，使用注意力机制
+        if need_compress.any():
+            # 获取注意力权重和中间结果
+            attn_weights, query, v = self.before_attn(Fv, mask)
+            
+            # 融合三种权重
+            combined_weights = self._weight_fusion(
+                attn_weights, extern_weight, position_weights, mask, batch_size, vid_len)
+            
+            # 使用融合后的权重计算加权和
+            weighted_v = torch.matmul(combined_weights, v)
+            
+            # 后续处理得到压缩后的特征
+            Fv_compress, compress_mask = self.after_attn(weighted_v, query, batch_size, device)
+        # 特殊情况，全部样本的有效长度都小于compress_len，这时就没有压缩的必要了
+        else:
+            # 所有样本都不需要压缩，只复制前压缩长度个特征
+            Fv_compress = torch.zeros(batch_size, self.compress_len, Fv.size(2), device=device)
+            compress_mask = torch.zeros(batch_size, self.compress_len, dtype=torch.bool, device=device)
+            
+            # 针对每个不需要压缩的样本
+            for i in range(batch_size):
+                valid_len = min(self._get_valid_lengths(mask)[i].item(), self.compress_len)
+                
+                # 从原始特征中复制有效部分
+                indices = original_indices[i, :valid_len]
+                Fv_compress[i, :valid_len] = Fv[i, indices]
+                
+                # 设置有效掩码
+                compress_mask[i, :valid_len] = True
+        
+        return Fv_compress, compress_mask
+
 # 1. 计算attention前，先把ex_weight乘到KV上
 class CompressorWithWeightedKV(CompressorWithExternalWeights):
     """
@@ -945,3 +1216,393 @@ class CompressorWithSmoothMechanism(CompressorWithExternalWeights):
         Fv_compress, compress_mask = self.after_attn(weighted_v, query, batch_size, device)
         
         return Fv_compress, compress_mask
+
+# 4. 残差，将压缩结果Fs和最近compress_len个long memory相加
+class ResidualCompressor(CompressorWithExternalWeights):
+    def __init__(self, compress_len, dimension, num_heads=8, dropout=0.1, weight_alpha=0.5, residual_weight=0.5):
+        super().__init__(compress_len=compress_len, dimension=dimension, weight_alpha=weight_alpha)
+        self.residual_weight = residual_weight
+        
+    def forward(self, Fv, extern_weight=None, mask=None):
+        batch_size, vid_len, _ = Fv.size()
+        device = Fv.device
+        
+        # 压缩
+        Fv_compress, compress_mask = super().forward(Fv, extern_weight, mask)
+
+        # # 根据mask取后compress_len个有效的long memory
+        # if mask is not None:
+        #     long_memory = Fv[mask.bool()]
+
+        #     print(long_memory.shape)
+        #     print(compress_mask.shape)
+        #     input("Press Enter to continue...")
+
+        #     Fo = long_memory[:, -self.compress_len:, :]
+        # else:
+        #     Fo = Fv[:, -self.compress_len:, :]
+
+        # 提取每个 batch 的有效特征
+        bool_mask = mask.bool()
+        Fo = []
+        for batch in range(Fv.shape[0]):
+            Fo.append(Fv[batch][bool_mask[batch]])
+            Fo[batch] = Fo[batch][-self.compress_len:]
+
+        # 将Fo中长度第一维长度小于compress_len的填充到compress_len
+        padded_Fo = torch.zeros(batch_size, self.compress_len, _)
+        for i in range(batch_size):
+            if Fo[i].shape[0] < self.compress_len:
+                padded_Fo[i] = F.pad(Fo[i], (0, 0, 0, self.compress_len - Fo[i].shape[0]), "constant", 0)
+            else:
+                padded_Fo[i] = Fo[i]
+        # 移动到相同的设备
+        padded_Fo = padded_Fo.to(device)
+        # 残差
+        # Fv_residual = Fv_compress + self.residual_weight * padded_Fo
+        Fv_residual = padded_Fo + self.residual_weight * Fv_compress
+
+        # 对于每个batch的结果，如果Fo长度小于等于compress_len，则直接返回未压缩的Fv，
+        # 并将mask根据Fo的长度重新设置：前len(Fo[i])个为有效，其余为无效
+        for i in range(batch_size):
+            if Fo[i].shape[0] <= self.compress_len:
+                Fv_residual[i] = Fv[i][:self.compress_len]
+                compress_mask[i] = torch.zeros(self.compress_len, dtype=torch.bool, device=device)
+                compress_mask[i][:len(Fo[i])] = True
+
+        return Fv_residual, compress_mask
+
+# 5. 残差+attn
+class CrossAttentionResidualCompressor(CompressorWithExternalWeights):
+    """
+    使用交叉注意力机制的残差压缩模块
+    
+    在压缩结果Fs的基础上，取最近的compress_len个记忆帧Fo，
+    通过 Fo + δ * attn(Fo, Fs) 的方式进行融合
+    
+    输入:
+        Fv: 长期视频记忆特征，形状为 (batch_size, vid_len, dimension)
+        extern_weight: 外部提供的权重，形状为 (batch_size, vid_len)
+        mask: 有效位置的掩码，形状为 (batch_size, vid_len)
+        
+    输出:
+        Fv_residual: 融合后的压缩视频特征，形状为 (batch_size, compress_len, dimension)
+        compress_mask: 压缩后的掩码，形状为 (batch_size, compress_len)
+    """
+    def __init__(self, dimension, compress_len, num_heads=8, dropout=0.1, weight_alpha=0.5, attn_weight=0.5):
+        """
+        初始化交叉注意力残差压缩模块
+        
+        参数:
+            dimension: 特征维度
+            compress_len: 压缩后的视频长度
+            num_heads: 多头注意力的头数
+            dropout: Dropout率
+            weight_alpha: 注意力权重和外部权重的融合比例
+            attn_weight: 注意力结果的权重系数δ
+        """
+        super().__init__(dimension, compress_len, num_heads, dropout, weight_alpha)
+        self.attn_weight = attn_weight  # δ参数，控制注意力结果的权重
+        
+        # 交叉注意力层的投影矩阵
+        self.cross_q_proj = nn.Linear(dimension, dimension)
+        self.cross_k_proj = nn.Linear(dimension, dimension)
+        self.cross_v_proj = nn.Linear(dimension, dimension)
+        
+        # 输出投影
+        self.cross_out_proj = nn.Linear(dimension, dimension)
+        
+        # Dropout
+        self.cross_dropout = nn.Dropout(dropout)
+        
+    def forward(self, Fv, extern_weight=None, mask=None):
+        """
+        前向传播
+        
+        参数:
+            Fv: 长期视频记忆特征，形状为 (batch_size, vid_len, dimension)
+            extern_weight: 外部提供的权重，形状为 (batch_size, vid_len)
+            mask: 有效位置的掩码，形状为 (batch_size, vid_len)
+            
+        返回:
+            Fv_residual: 融合后的压缩视频特征，形状为 (batch_size, compress_len, dimension)
+            compress_mask: 压缩后的掩码，形状为 (batch_size, compress_len)
+        """
+        batch_size, vid_len, dimension = Fv.size()
+        device = Fv.device
+        
+        # 1. 首先获取压缩的视频特征 Fs (Fv_compress)
+        Fs, compress_mask = super().forward(Fv, extern_weight, mask)
+        
+        # 2. 提取每个batch的最近compress_len个有效特征作为Fo
+        bool_mask = mask.bool() if mask is not None else torch.ones(batch_size, vid_len, dtype=torch.bool, device=device)
+        Fo_list = []
+        for batch in range(batch_size):
+            # 获取当前批次的有效特征
+            valid_features = Fv[batch][bool_mask[batch]]
+            # 取最后compress_len个
+            Fo_list.append(valid_features[-self.compress_len:])
+        
+        # 3. 创建Fo的填充张量和Fo的掩码
+        padded_Fo = torch.zeros(batch_size, self.compress_len, dimension, device=device)
+        fo_mask = torch.zeros(batch_size, self.compress_len, dtype=torch.bool, device=device)
+        
+        for i in range(batch_size):
+            fo_len = Fo_list[i].shape[0]
+            # 如果Fo长度小于compress_len，进行填充
+            if fo_len < self.compress_len:
+                padded_Fo[i, :fo_len] = Fo_list[i]
+                fo_mask[i, :fo_len] = True
+            else:
+                padded_Fo[i] = Fo_list[i]
+                fo_mask[i] = torch.ones(self.compress_len, dtype=torch.bool, device=device)
+        
+        # 4. 对于batch中Fo长度小于等于compress_len的样本，直接使用原始特征
+        # 创建结果变量，初始为Fs
+        Fv_residual = Fs.clone()
+        special_cases = []
+        
+        for i in range(batch_size):
+            if Fo_list[i].shape[0] <= self.compress_len:
+                # 如果Fo长度小于等于compress_len，直接使用原始特征
+                Fv_residual[i, :Fo_list[i].shape[0]] = Fv[i][bool_mask[i]][-Fo_list[i].shape[0]:]
+                compress_mask[i] = torch.zeros(self.compress_len, dtype=torch.bool, device=device)
+                compress_mask[i][:Fo_list[i].shape[0]] = True
+                special_cases.append(i)
+        
+        # 如果所有batch都是特殊情况，直接返回结果
+        if len(special_cases) == batch_size:
+            return Fv_residual, compress_mask
+        
+        # 创建一个掩码，标记哪些batch需要进行交叉注意力计算
+        batch_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+        for idx in special_cases:
+            batch_mask[idx] = False
+        
+        # 5. 对其余样本执行交叉注意力: Fo作为query，Fs作为key和value
+        if batch_mask.any():
+            # 筛选需要进行注意力计算的batch
+            filtered_Fo = padded_Fo[batch_mask]
+            filtered_Fs = Fs[batch_mask]
+            filtered_fo_mask = fo_mask[batch_mask]
+            
+            # 交叉注意力计算
+            # 5.1 投影query, key, value
+            q = self.cross_q_proj(filtered_Fo)  # (filtered_batch_size, compress_len, dimension)
+            k = self.cross_k_proj(filtered_Fs)  # (filtered_batch_size, compress_len, dimension)
+            v = self.cross_v_proj(filtered_Fs)  # (filtered_batch_size, compress_len, dimension)
+            
+            # 5.2 分割多头
+            filtered_batch_size = filtered_Fo.size(0)
+            head_dim = dimension // self.num_heads
+            
+            # 重塑为多头格式
+            q = q.view(filtered_batch_size, -1, self.num_heads, head_dim).transpose(1, 2)
+            k = k.view(filtered_batch_size, -1, self.num_heads, head_dim).transpose(1, 2)
+            v = v.view(filtered_batch_size, -1, self.num_heads, head_dim).transpose(1, 2)
+            
+            # 5.3 计算注意力分数
+            # (filtered_batch_size, num_heads, compress_len, head_dim) @ (filtered_batch_size, num_heads, head_dim, compress_len)
+            # -> (filtered_batch_size, num_heads, compress_len, compress_len)
+            scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(head_dim)
+            
+            # 应用Fo的掩码（确保填充部分不参与注意力计算）
+            if filtered_fo_mask is not None:
+                # 扩展掩码以适应多头注意力的形状
+                # (filtered_batch_size, compress_len) -> (filtered_batch_size, 1, compress_len, 1)
+                q_mask = filtered_fo_mask.unsqueeze(1).unsqueeze(-1)
+                # 在无效查询位置应用大的负值
+                scores = scores.masked_fill(~q_mask.bool(), -1e9)
+            
+            # 应用softmax得到注意力权重
+            attn_weights = F.softmax(scores, dim=-1)  # (filtered_batch_size, num_heads, compress_len, compress_len)
+            attn_weights = self.cross_dropout(attn_weights)
+            
+            # 5.4 计算加权和
+            # (filtered_batch_size, num_heads, compress_len, compress_len) @ (filtered_batch_size, num_heads, compress_len, head_dim)
+            # -> (filtered_batch_size, num_heads, compress_len, head_dim)
+            weighted_v = torch.matmul(attn_weights, v)
+            
+            # 5.5 合并多头结果
+            weighted_v = weighted_v.transpose(1, 2).contiguous()  # (filtered_batch_size, compress_len, num_heads, head_dim)
+            weighted_v = weighted_v.view(filtered_batch_size, self.compress_len, dimension)  # (filtered_batch_size, compress_len, dimension)
+            
+            # 5.6 应用输出投影
+            attn_output = self.cross_out_proj(weighted_v)  # (filtered_batch_size, compress_len, dimension)
+            
+            # 6. 计算残差连接: Fo + δ * attn(Fo, Fs)
+            # 对于Fo的无效(padding)部分，我们不应用残差
+            filtered_residual = filtered_Fo + self.attn_weight * attn_output
+            
+            # 7. 将结果放回到原始batch中
+            Fv_residual[batch_mask] = filtered_residual
+        
+        return Fv_residual, compress_mask
+
+class CrossAttentionResidualCompressorWithQuery(TextGuidedCompressor):
+    """
+    使用交叉注意力机制的残差压缩模块
+    
+    在压缩结果Fs的基础上，取最近的compress_len个记忆帧Fo，
+    通过 Fo + δ * attn(Fo, Fs) 的方式进行融合
+    
+    输入:
+        Fv: 长期视频记忆特征，形状为 (batch_size, vid_len, dimension)
+        extern_weight: 外部提供的权重，形状为 (batch_size, vid_len)
+        mask: 有效位置的掩码，形状为 (batch_size, vid_len)
+        
+    输出:
+        Fv_residual: 融合后的压缩视频特征，形状为 (batch_size, compress_len, dimension)
+        compress_mask: 压缩后的掩码，形状为 (batch_size, compress_len)
+    """
+    def __init__(self, dimension, compress_len, num_heads=8, dropout=0.1, weight_alpha=0.5, attn_weight=0.5):
+        """
+        初始化交叉注意力残差压缩模块
+        
+        参数:
+            dimension: 特征维度
+            compress_len: 压缩后的视频长度
+            num_heads: 多头注意力的头数
+            dropout: Dropout率
+            weight_alpha: 注意力权重和外部权重的融合比例
+            attn_weight: 注意力结果的权重系数δ
+        """
+        super().__init__(t_dim=dimension,v_dim = dimension,hidden_dim=dimension, compress_len=compress_len, num_heads=num_heads, dropout=dropout, weight_alpha=weight_alpha)
+        self.attn_weight = attn_weight  # δ参数，控制注意力结果的权重
+        
+        # 交叉注意力层的投影矩阵
+        self.cross_q_proj = nn.Linear(dimension, dimension)
+        self.cross_k_proj = nn.Linear(dimension, dimension)
+        self.cross_v_proj = nn.Linear(dimension, dimension)
+        
+        # 输出投影
+        self.cross_out_proj = nn.Linear(dimension, dimension)
+        
+        # Dropout
+        self.cross_dropout = nn.Dropout(dropout)
+        
+    def forward(self, Ft, text_mask, Fv, extern_weight=None, vid_mask=None):
+        """
+        前向传播
+        
+        参数:
+            Ft: 文本特征，形状为 (batch_size, num_token, t_dim)
+            text_mask: 文本掩码，形状为 (batch_size, num_token)
+            Fv: 长期视频记忆特征，形状为 (batch_size, vid_len, dimension)
+            extern_weight: 外部提供的权重，形状为 (batch_size, vid_len)
+            mask: 有效位置的掩码，形状为 (batch_size, vid_len)
+            
+        返回:
+            Fv_residual: 融合后的压缩视频特征，形状为 (batch_size, compress_len, dimension)
+            compress_mask: 压缩后的掩码，形状为 (batch_size, compress_len)
+        """
+        batch_size, vid_len, dimension = Fv.size()
+        device = Fv.device
+        
+        # 1. 首先获取压缩的视频特征 Fs (Fv_compress)
+        Fs, compress_mask = super().forward(Ft, Fv, vid_mask = vid_mask, text_mask = text_mask, extern_weight = extern_weight)
+        
+        # 2. 提取每个batch的最近compress_len个有效特征作为Fo
+        bool_mask = vid_mask.bool() if vid_mask is not None else torch.ones(batch_size, vid_len, dtype=torch.bool, device=device)
+        Fo_list = []
+        for batch in range(batch_size):
+            # 获取当前批次的有效特征
+            valid_features = Fv[batch][bool_mask[batch]]
+            # 取最后compress_len个
+            Fo_list.append(valid_features[-self.compress_len:])
+        
+        # 3. 创建Fo的填充张量和Fo的掩码
+        padded_Fo = torch.zeros(batch_size, self.compress_len, dimension, device=device)
+        fo_mask = torch.zeros(batch_size, self.compress_len, dtype=torch.bool, device=device)
+        
+        for i in range(batch_size):
+            fo_len = Fo_list[i].shape[0]
+            # 如果Fo长度小于compress_len，进行填充
+            if fo_len < self.compress_len:
+                padded_Fo[i, :fo_len] = Fo_list[i]
+                fo_mask[i, :fo_len] = True
+            else:
+                padded_Fo[i] = Fo_list[i]
+                fo_mask[i] = torch.ones(self.compress_len, dtype=torch.bool, device=device)
+        
+        # 4. 对于batch中Fo长度小于等于compress_len的样本，直接使用原始特征
+        # 创建结果变量，初始为Fs
+        Fv_residual = Fs.clone()
+        special_cases = []
+        
+        for i in range(batch_size):
+            if Fo_list[i].shape[0] <= self.compress_len:
+                # 如果Fo长度小于等于compress_len，直接使用原始特征
+                Fv_residual[i, :Fo_list[i].shape[0]] = Fv[i][bool_mask[i]][-Fo_list[i].shape[0]:]
+                compress_mask[i] = torch.zeros(self.compress_len, dtype=torch.bool, device=device)
+                compress_mask[i][:Fo_list[i].shape[0]] = True
+                special_cases.append(i)
+        
+        # 如果所有batch都是特殊情况，直接返回结果
+        if len(special_cases) == batch_size:
+            return Fv_residual, compress_mask
+        
+        # 创建一个掩码，标记哪些batch需要进行交叉注意力计算
+        batch_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+        for idx in special_cases:
+            batch_mask[idx] = False
+        
+        # 5. 对其余样本执行交叉注意力: Fo作为query，Fs作为key和value
+        if batch_mask.any():
+            # 筛选需要进行注意力计算的batch
+            filtered_Fo = padded_Fo[batch_mask]
+            filtered_Fs = Fs[batch_mask]
+            filtered_fo_mask = fo_mask[batch_mask]
+            
+            # 交叉注意力计算
+            # 5.1 投影query, key, value
+            q = self.cross_q_proj(filtered_Fo)  # (filtered_batch_size, compress_len, dimension)
+            k = self.cross_k_proj(filtered_Fs)  # (filtered_batch_size, compress_len, dimension)
+            v = self.cross_v_proj(filtered_Fs)  # (filtered_batch_size, compress_len, dimension)
+            
+            # 5.2 分割多头
+            filtered_batch_size = filtered_Fo.size(0)
+            head_dim = dimension // self.num_heads
+            
+            # 重塑为多头格式
+            q = q.view(filtered_batch_size, -1, self.num_heads, head_dim).transpose(1, 2)
+            k = k.view(filtered_batch_size, -1, self.num_heads, head_dim).transpose(1, 2)
+            v = v.view(filtered_batch_size, -1, self.num_heads, head_dim).transpose(1, 2)
+            
+            # 5.3 计算注意力分数
+            # (filtered_batch_size, num_heads, compress_len, head_dim) @ (filtered_batch_size, num_heads, head_dim, compress_len)
+            # -> (filtered_batch_size, num_heads, compress_len, compress_len)
+            scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(head_dim)
+            
+            # 应用Fo的掩码（确保填充部分不参与注意力计算）
+            if filtered_fo_mask is not None:
+                # 扩展掩码以适应多头注意力的形状
+                # (filtered_batch_size, compress_len) -> (filtered_batch_size, 1, compress_len, 1)
+                q_mask = filtered_fo_mask.unsqueeze(1).unsqueeze(-1)
+                # 在无效查询位置应用大的负值
+                scores = scores.masked_fill(~q_mask.bool(), -1e9)
+            
+            # 应用softmax得到注意力权重
+            attn_weights = F.softmax(scores, dim=-1)  # (filtered_batch_size, num_heads, compress_len, compress_len)
+            attn_weights = self.cross_dropout(attn_weights)
+            
+            # 5.4 计算加权和
+            # (filtered_batch_size, num_heads, compress_len, compress_len) @ (filtered_batch_size, num_heads, compress_len, head_dim)
+            # -> (filtered_batch_size, num_heads, compress_len, head_dim)
+            weighted_v = torch.matmul(attn_weights, v)
+            
+            # 5.5 合并多头结果
+            weighted_v = weighted_v.transpose(1, 2).contiguous()  # (filtered_batch_size, compress_len, num_heads, head_dim)
+            weighted_v = weighted_v.view(filtered_batch_size, self.compress_len, dimension)  # (filtered_batch_size, compress_len, dimension)
+            
+            # 5.6 应用输出投影
+            attn_output = self.cross_out_proj(weighted_v)  # (filtered_batch_size, compress_len, dimension)
+            
+            # 6. 计算残差连接: Fo + δ * attn(Fo, Fs)
+            # 对于Fo的无效(padding)部分，我们不应用残差
+            filtered_residual = filtered_Fo + self.attn_weight * attn_output
+            
+            # 7. 将结果放回到原始batch中
+            Fv_residual[batch_mask] = filtered_residual
+        
+        return Fv_residual, compress_mask
