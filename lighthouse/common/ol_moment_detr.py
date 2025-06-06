@@ -11,16 +11,19 @@ from lighthouse.common.misc import accuracy
 from lighthouse.common.moment_transformer import build_transformer
 from lighthouse.common.position_encoding import build_position_encoding
 from lighthouse.common.utils.span_utils import temporal_iou, generalized_temporal_iou, span_cxw_to_xx
-from lighthouse.common.compressor import MultimodalTokenCompressor
-from lighthouse.common.compressor import SimpleCompressor, TextGuidedCompressor, CompressorWithExternalWeights, CompressorWithWeightedKV, CompressorWithPostWeighting, CompressorWithSmoothMechanism, ResidualCompressor, CrossAttentionResidualCompressor, CompressorWithPositionWeights, CrossAttentionResidualCompressorWithQuery
-
+from lighthouse.common.compressor import SimpleCompressor
+from lighthouse.common.compressor import ResidualCompressor, CrossAttentionResidualCompressor, CrossAttentionResidualCompressorWithQuery
+from lighthouse.common.compressor import CompressorWithExternalWeights, CompressorWithWeightedKV, CompressorWithPostWeighting, CompressorWithSmoothMechanism, CompressorWithPositionWeights
+from lighthouse.common.compressor import ConcatCompressor, CrossAttentionConcatCompressor
+from lighthouse.common.compressor import MultimodalTokenCompressor, TextGuidedCompressor,TextPresentGuidedCompressor
+from lighthouse.common.memoryModule import InterMemory, InterMemorySeq
 
 class OLMomentDETR(nn.Module):
     """ This is the Moment-DETR module that performs moment localization. """
 
     def __init__(self, transformer, position_embed, txt_position_embed, txt_dim, vid_dim,
-                 num_queries, input_dropout, aux_loss=False, max_v_l=75, span_loss_type="l1", 
-                 use_txt_pos=False, n_input_proj=2, aud_dim=0, compress_len=10, use_vid_compression=True, weight_alpha=0.5):
+                 num_queries, input_dropout, weight_alpha, attn_weight, future_memory_sample_len, aux_loss=False, max_v_l=75, span_loss_type="l1", 
+                 use_txt_pos=False, n_input_proj=2, aud_dim=0, compress_len=10, use_vid_compression=True, use_inter_memory=True):
         """ Initializes the model.
         Parameters:
             transformer: torch module of the transformer architecture. See transformer.py
@@ -50,6 +53,8 @@ class OLMomentDETR(nn.Module):
         self.frame_class_embed = MLP(hidden_dim, hidden_dim, 4, 3)  # 输出维度仍为4，但表示4个二分类的logits
         self.saliency_proj = nn.Linear(hidden_dim, 1)
         self.compress_len = compress_len
+        self.future_memory_sample_len = future_memory_sample_len
+        self.use_inter_memory = use_inter_memory
 
         # 一个字典，记录每个[qid_vid]对对应的视频的显著性分数值
         # 用saliency_score_dict[qid_vid]可以快速访问
@@ -73,8 +78,19 @@ class OLMomentDETR(nn.Module):
             # self.memory_compressor = CompressorWithPostWeighting(hidden_dim, compress_len=self.compress_len)
             # self.memory_compressor = ResidualCompressor(dimension=hidden_dim, compress_len=self.compress_len, weight_alpha=weight_alpha)
             # self.memory_compressor = CrossAttentionResidualCompressor(dimension=hidden_dim, compress_len=self.compress_len, weight_alpha=weight_alpha)
-            self.memory_compressor = CrossAttentionResidualCompressorWithQuery(dimension=hidden_dim, compress_len=self.compress_len, weight_alpha=weight_alpha, attn_weight=0.3)
+            self.memory_compressor = CrossAttentionResidualCompressorWithQuery(dimension=hidden_dim, compress_len=self.compress_len, weight_alpha=weight_alpha, attn_weight=attn_weight)
             # self.memory_compressor = CompressorWithPositionWeights(dimension=hidden_dim, compress_len=self.compress_len)
+            # self.memory_compressor = ConcatCompressor(dimension=hidden_dim, compress_len=self.compress_len, weight_alpha=weight_alpha)
+            # self.memory_compressor = CrossAttentionConcatCompressor(dimension=hidden_dim, compress_len=self.compress_len, weight_alpha=weight_alpha)
+            # self.memory_compressor = TextPresentGuidedCompressor(t_dim = hidden_dim,v_dim = hidden_dim,hidden_dim = hidden_dim,compress_len=self.compress_len)
+
+        if self.use_inter_memory and self.future_memory_sample_len > 0:
+            # self.inter_memory = InterMemory(d_model=hidden_dim, future_length=future_memory_sample_len, memory_slots=64, similarity_threshold=0.05)
+            # self.inter_memory = InterMemorySeq(d_model=hidden_dim, future_length=future_memory_sample_len, memory_slots=64, similarity_threshold=0.05)
+            # 记忆槽长度64，输入原始历史帧特征序列
+            # self.inter_memory = InterMemorySeq(d_model=hidden_dim, future_length=future_memory_sample_len, memory_slots=64, similarity_threshold=0.9, diversity_loss_weight=0.5, optimization_interval=10, optimizer_lr=1e-4)
+            # 记忆槽长度为压缩后的帧特征长度，输入压缩后的历史帧特征序列
+            self.inter_memory = InterMemorySeq(d_model=hidden_dim, future_length=future_memory_sample_len, memory_slots=64, slot_len=self.compress_len, similarity_threshold=0.9, diversity_loss_weight=0.5, optimization_interval=10, optimizer_lr=1e-4)
 
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         relu_args = [True] * 3
@@ -92,8 +108,8 @@ class OLMomentDETR(nn.Module):
 
         self.aux_loss = aux_loss
 
-    def forward(self, src_txt, src_txt_mask, src_vid, memory_len, src_vid_mask, chunk_idx, src_aud=None, src_aud_mask=None,
-                long_memory_weight=None, qid_vid=None, short_memory_start=None):
+    def forward(self, src_txt, src_txt_mask, src_vid, memory_len, src_vid_mask, chunk_idx,qid_vid, short_memory_start, src_aud=None, src_aud_mask=None,
+                long_memory_weight=None):
         """
         在线模型forward需要的输入:
                 -src_txt: [batch_size, L_txt, D_txt]
@@ -101,9 +117,10 @@ class OLMomentDETR(nn.Module):
                 -src_vid: [batch_size, L_vid, D_vid], 
                     L_vid = long_memory_sample_length + short_memory_sample_length + future_memory_sample_length
                 - src_vid_mask: [batch_size, L_vid]
-                -memory_len: [], 三种记忆的采样长度
+                -memory_len: [], 三种记忆的采样长度(但其实future_length因为不是数据集提供的，所以设置的为0)
                 -long_memory_weight: [batch_size, L_vid],在train的时候使用,用于提供extern_weight
-                    -qid_vid: [batch_size,],在eval/val的时候使用的，用于将样本和saliency_score_dict中的标签匹配
+                    -qid_vid: [batch_size,],在eval/train的时候都提供，用于将样本和saliency_score_dict中的标签匹配
+                                以及update_memory时提供
             返回值为包含以下内容的dict:
                 -"pred_spans": The normalized boxes coordinates for all queries, represented as
                                (center_x, width). These values are normalized in [0, 1],
@@ -148,26 +165,37 @@ class OLMomentDETR(nn.Module):
         long_vid = src_vid[:, :memory_len[0]]
         long_vid_mask = src_vid_mask[:, :memory_len[0]]
 
-        # # 逐个样本的检查mask
-        # flag = 1
-        # for i in range(long_vid_mask.shape[0]):
-        #     if(long_vid_mask[i][0]!=0): 
-        #         print("long_vid_mask[", i, "]:\n", long_vid_mask[i])
-        #         print("src_txt_mask[", i, "]:\n", src_txt_mask[i])
-        #         flag = input("1 to continue, 0 to exit")
-        #         if flag == '0':
-        #             break
-            
+        present_vid = src_vid[:, memory_len[0]:]
+        
+        # if self.use_inter_memory and self.inter_memory is not None:
+        #     # 确保 InterMemory 的参数与输入同设备
+        #     if self.inter_memory.memory.device != src_vid.device:
+        #         self.inter_memory.memory.data = self.inter_memory.memory.data.to(src_vid.device)
+        #         self.inter_memory.future_embedding.data = self.inter_memory.future_embedding.data.to(src_vid.device)
 
+        #     # # 更新interMemory
+        #     # vid = [item[1] for item in qid_vid]
+        #     # # self.inter_memory.update_memory(features=long_vid,mask=long_vid_mask,vid=vid,short_start=short_memory_start)
+        #     # # self.inter_memory.update_memory(type="competitive",features=long_vid,mask=long_vid_mask,temperature=0.5)
+        #     # # self.inter_memory.update_memory(type="reorganization",features=long_vid,mask=long_vid_mask,reorganize_threshold=0.8,update_interval=20, temperature=0.5)
+        #     # self.inter_memory.update_memory(type="normal",features=long_vid,mask=long_vid_mask)
+        #     # # 获得预测特征
+        #     # future_vid, future_mask = self.inter_memory.predict_future(history_features=long_vid,mask=long_vid_mask,current_features=present_vid)
+            
+        #     # 调用forward，更新并预测
+        #     future_vid, future_mask = self.inter_memory.forward(history_features=long_vid,mask=long_vid_mask,current_features=present_vid)
+        #     # 将未来部分拼接
+        #     src_vid = torch.cat([src_vid, future_vid], dim=1)
+        #     src_vid_mask = torch.cat([src_vid_mask, future_mask], dim=1)
         # 压缩长期记忆
         if self.use_vid_compression:
             # 训练/val均使用数据集提供的显著性分数作为extern_weight，验证方法的upbound
             # extern_weight = long_memory_weight
 
-            # 如果是train，使用数据集提供的mid分数作为extern_weight
+            # 如果是train，使用数据集提供的显著性分数作为extern_weight
             if self.training:
                 extern_weight = long_memory_weight
-            else: # inference时，使用过去推理的mid结果
+            else: # inference时，使用过去推理的结果
                 all_weights = []
                 extern_weight = None  # 显式初始化
 
@@ -202,6 +230,13 @@ class OLMomentDETR(nn.Module):
             # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, mask=long_vid_mask, query=src_txt, query_mask=src_txt_mask)
             # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, vid_mask=long_vid_mask, Ft=src_txt, text_mask=src_txt_mask)
             compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, vid_mask=long_vid_mask, Ft=src_txt, text_mask=src_txt_mask,extern_weight=extern_weight)
+            # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, vid_mask=long_vid_mask, Ft=src_txt, text_mask=src_txt_mask, Fg=present_vid)
+
+            # print("chunk_idx\n", chunk_idx)
+            # print("压缩结果的形状\n", compress_long_vid.shape)
+            # print("完整压缩结果\n", compress_long_vid)
+            # print("压缩后的mask\n", compress_long_mask)
+            # input("Press Enter to continue...")
 
             # print("shape of compress_long_vid:", compress_long_vid.shape)
             # print("shape of compress_long_mask:", compress_long_mask.shape)
@@ -232,17 +267,24 @@ class OLMomentDETR(nn.Module):
             #     if flag == '0':
             #         break
 
+        # 适用压缩后的历史记忆维护interMemory
+        if self.use_inter_memory and self.inter_memory is not None and self.use_vid_compression:
+            # 确保 InterMemory 的参数与输入同设备
+            if self.inter_memory.memory.device != src_vid.device:
+                self.inter_memory.memory.data = self.inter_memory.memory.data.to(src_vid.device)
+                self.inter_memory.future_embedding.data = self.inter_memory.future_embedding.data.to(src_vid.device)
+            # 调用forward，更新并预测
+            future_vid, future_mask = self.inter_memory.forward(history_features=compress_long_vid,mask=compress_long_mask,current_features=present_vid)
+
+            # 将未来部分拼接
+            src_vid = torch.cat([src_vid, future_vid], dim=1)
+            src_vid_mask = torch.cat([src_vid_mask, future_mask], dim=1)
+
         #   拼接视频和文本的特征，掩码
         src = torch.cat([src_vid, src_txt], dim=1)  # (bsz, L_vid+L_txt, d)
         mask = torch.cat([src_vid_mask, src_txt_mask], dim=1).bool()  # (bsz, L_vid+L_txt)
         #   分别生成位置编码并拼接
         pos_vid = self.position_embed(src_vid, src_vid_mask)  # (bsz, L_vid, d)
-
-        # print("after compress, src_vid shape and src_vid_mask shape:", src_vid.shape, src_vid_mask.shape)
-        # print("shape of src, mask, pos_vid:", src.shape, mask.shape, pos_vid.shape)
-        # input("press enter to continue...")
-
-
         pos_txt = self.txt_position_embed(src_txt) if self.use_txt_pos else torch.zeros_like(src_txt)  # (bsz, L_txt, d)
         pos = torch.cat([pos_vid, pos_txt], dim=1)
         # (#layers, bsz, #queries, d), (bsz, L_vid+L_txt, d)
@@ -267,6 +309,12 @@ class OLMomentDETR(nn.Module):
         vid_mem = memory[:, :src_vid.shape[1]]  # (bsz, L_vid, d)
         short_start = memory_len[0]
         short_end = short_start + memory_len[1]
+
+        # print("memory_len: ",memory_len)
+        # print("short_start: ",short_start)
+        # print("short_end: ",short_end)
+        # print("vid_mem shape: ",vid_mem.shape)
+        # input("Press Enter to continue...")
         
         out['frame_pred'] = self.frame_class_embed(vid_mem)[:, short_start:short_end]    # (bsz, short_memory_length, 4)
         out["saliency_scores"] = self.saliency_proj(vid_mem).squeeze(-1)[:, short_start:short_end]  # (bsz, short_memory_length)
@@ -335,6 +383,11 @@ class OLMomentDETR(nn.Module):
     def reset_saliency_score_dict(self):
         self.saliency_score_dict = {}
 
+    # 重新初始化inter_memory，用于两个epoch之间
+    def reset_inter_memory(self):
+        if self.use_inter_memory and self.inter_memory is not None:
+            self.inter_memory.reset()
+
     def process_probs_by_avg(self,probs):
         return np.mean(probs, axis=0)
 
@@ -384,9 +437,12 @@ class OLMomentDETR(nn.Module):
         if weight_start > short_start:
             return None
         raw_res = weight_list[:short_start]
+        # 对应一些特殊情况，比如一些很长的视频，到最后只能将这些视频的相邻样本放进一个batch
+        # 这时一些样本在推理时，并不是所有历史帧的分数都已经保存
         if len(weight_list)<short_start:
             raw_res = np.pad(weight_list, (0, short_start - len(weight_list)), 'constant', constant_values=0)
         if len(raw_res) < return_len:
+            # 和mask保持一致，有效位在左侧
             raw_res = np.pad(raw_res, (0, return_len - len(raw_res)), 'constant', constant_values=0)
         else:
             raw_res = raw_res[-return_len:]
@@ -850,7 +906,10 @@ def build_model(args):
         n_input_proj=args.n_input_proj,
         compress_len=args.compress_len,
         use_vid_compression=args.use_vid_compression,
-        weight_alpha=args.weight_alpha
+        use_inter_memory=args.use_inter_memory,
+        weight_alpha=args.weight_alpha,
+        attn_weight=args.attn_weight,
+        future_memory_sample_len=args.future_memory_sample_len,
     )
 
     matcher = build_matcher(args)
@@ -866,6 +925,7 @@ def build_model(args):
     
     # 条件性添加损失项
     losses = ['labels', 'saliency', 'span']
+    # losses = ['labels', 'span']
     
     # loss_label消融实验
     # losses = ['labels', 'saliency']

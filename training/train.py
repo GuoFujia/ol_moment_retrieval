@@ -117,6 +117,11 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i):
     batch_input_fn = prepare_batch_inputs_ol  
     logger.info(f"[Epoch {epoch_i+1}]")
     model.train()
+
+    if model.use_inter_memory and model.future_memory_sample_len > 0:
+        print("after ",model.inter_memory.getUpdateCnt()," updates, interMemory reset in a new epoch.")
+        model.inter_memory.reset()
+
     criterion.train()
 
     # init meters
@@ -214,7 +219,12 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
             # 如果当前分数优于之前的最佳分数，则保存模型
             if stop_score > prev_best_score:
                 prev_best_score = stop_score
-                save_checkpoint(model, optimizer, lr_scheduler, epoch_i, opt)
+                if model.use_inter_memory and model.future_memory_sample_len > 0:
+                    save_checkpoint(model, optimizer, lr_scheduler, epoch_i, opt, 
+                        inter_memory_update_cnt=model.inter_memory.getUpdateCnt(), 
+                        memory_optimizer=model.inter_memory.memory_optimizer)
+                else:
+                    save_checkpoint(model, optimizer, lr_scheduler, epoch_i, opt)
                 logger.info("The checkpoint file has been updated.")
                 rename_latest_to_best(latest_file_paths)
 

@@ -143,6 +143,132 @@ class TextGuidedVideoAttention(nn.Module):
         
         return Fv_enhanced
 
+class PresentGuidedVideoAttention(nn.Module):
+    """
+    基于视觉引导的视频特征注意力模块
+    
+    输入:
+        Fg: 作为指导的视频特征，形状为 (batch_size, guide_vid_len, dim)
+        Fv: 视频特征，形状为 (batch_size, vid_len, dim)
+        vid_mask: Fv的视频掩码，形状为 (batch_size, vid_len)，True/1表示有效位置
+        
+    输出:
+        Fv_enhanced: 增强后的视频特征，保持原始形状 (batch_size, vid_len, dim)
+    """
+    def __init__(self, dim, hidden_dim=512, num_heads=8, dropout=0.1):
+        """
+        初始化函数
+        
+        参数:
+            dim: 输入特征维度
+            hidden_dim: 内部处理的隐藏维度
+            num_heads: 多头注意力的头数
+            dropout: 随机失活率
+        """
+        super(PresentGuidedVideoAttention, self).__init__()
+        
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        
+        # 确保hidden_dim可以被num_heads整除
+        assert hidden_dim % num_heads == 0, "隐藏维度必须能被头数整除"
+        
+        # 投影层 - 视频特征作为query，指导特征作为key和value
+        self.v_proj = nn.Linear(dim, hidden_dim)
+        self.g_key_proj = nn.Linear(dim, hidden_dim)
+        self.g_val_proj = nn.Linear(dim, hidden_dim)
+        
+        # 输出投影层
+        self.out_proj = nn.Linear(hidden_dim, dim)
+        
+        # Dropout层
+        self.attn_dropout = nn.Dropout(dropout)
+        self.proj_dropout = nn.Dropout(dropout)
+        
+        # 层归一化
+        self.norm = nn.LayerNorm(dim)
+        
+        # 前馈网络
+        self.feed_forward = nn.Sequential(
+            nn.Linear(dim, 4 * dim),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(4 * dim, dim),
+            nn.Dropout(dropout)
+        )
+        
+        # 最终层归一化
+        self.final_norm = nn.LayerNorm(dim)
+    
+    def forward(self, Fg, Fv, vid_mask=None):
+        """
+        前向传播
+        
+        参数:
+            Fg: 指导特征，形状为 (batch_size, guide_vid_len, dim)
+            Fv: 视频特征，形状为 (batch_size, vid_len, dim)
+            vid_mask: 视频掩码，形状为 (batch_size, vid_len)，True/1表示有效位置
+            
+        返回:
+            Fv_enhanced: 增强后的视频特征，形状为 (batch_size, vid_len, dim)
+        """
+        batch_size, vid_len, _ = Fv.size()
+        _, guide_vid_len, _ = Fg.size()
+        
+        # 1. 投影query, key, value
+        q = self.v_proj(Fv)              # (batch_size, vid_len, hidden_dim)
+        k = self.g_key_proj(Fg)          # (batch_size, guide_vid_len, hidden_dim)
+        v = self.g_val_proj(Fg)          # (batch_size, guide_vid_len, hidden_dim)
+        
+        # 2. 分割多头
+        head_dim = self.hidden_dim // self.num_heads
+        
+        # 重塑为多头格式
+        q = q.view(batch_size, -1, self.num_heads, head_dim)  
+        k = k.view(batch_size, -1, self.num_heads, head_dim)
+        v = v.view(batch_size, -1, self.num_heads, head_dim)
+        
+        # 交换维度以便于计算
+        q = q.transpose(1, 2)  # (batch_size, num_heads, vid_len, head_dim)
+        k = k.transpose(1, 2)  # (batch_size, num_heads, guide_vid_len, head_dim)
+        v = v.transpose(1, 2)  # (batch_size, num_heads, guide_vid_len, head_dim)
+        
+        # 3. 计算注意力分数
+        scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(head_dim)
+        
+        # 4. 应用softmax得到注意力权重
+        attn_weights = F.softmax(scores, dim=-1)  # (batch_size, num_heads, vid_len, guide_vid_len)
+        attn_weights = self.attn_dropout(attn_weights)
+        
+        # 5. 加权聚合指导特征信息
+        weighted_v = torch.matmul(attn_weights, v)
+        
+        # 6. 合并多头结果
+        weighted_v = weighted_v.transpose(1, 2).contiguous()
+        weighted_v = weighted_v.view(batch_size, vid_len, self.hidden_dim)
+        
+        # 7. 应用输出投影
+        attn_output = self.out_proj(weighted_v)
+        attn_output = self.proj_dropout(attn_output)
+        
+        # 8. 残差连接和层归一化
+        attn_output = self.norm(Fv + attn_output)
+        
+        # 9. 前馈网络
+        ff_output = self.feed_forward(attn_output)
+        
+        # 10. 残差连接和最终层归一化
+        Fv_enhanced = self.final_norm(attn_output + ff_output)
+        
+        # 11. 应用视频掩码（如果提供）
+        if vid_mask is not None:
+            # 扩展掩码维度以匹配输出形状
+            mask_expanded = vid_mask.unsqueeze(-1).float()  # (batch_size, vid_len, 1)
+            Fv_enhanced = Fv_enhanced * mask_expanded
+        
+        return Fv_enhanced
+
 class SimpleCompressor(nn.Module):
     """
     基于注意力机制的视频记忆压缩模块
@@ -319,22 +445,17 @@ class TextGuidedCompressor(nn.Module):
             v_dim=v_dim,
             hidden_dim=hidden_dim)
             
+        # 文本增强视频特征压缩器
+        self.text_enhanced_memory_compressor = SimpleCompressor(
+            v_dim, 
+            compress_len=compress_len)
         if weight_alpha is None:
-            # 直接视频特征压缩器
+            # 文本增强视频特征压缩器
             self.direct_memory_compressor = SimpleCompressor(
                 v_dim, 
                 compress_len=compress_len)
-                
-            # 文本增强视频特征压缩器
-            self.text_enhanced_memory_compressor = SimpleCompressor(
-                v_dim, 
-                compress_len=compress_len)
         else:
-            self.direct_memory_compressor =CompressorWithExternalWeights(
-                v_dim, 
-                compress_len=compress_len,
-                weight_alpha=weight_alpha)
-            self.text_enhanced_memory_compressor = CompressorWithExternalWeights(
+            self.direct_memory_compressor = CompressorWithExternalWeights(
                 v_dim, 
                 compress_len=compress_len,
                 weight_alpha=weight_alpha)
@@ -379,17 +500,13 @@ class TextGuidedCompressor(nn.Module):
         """
         # 文本引导增强的视频特征 - (batch_size, vid_len, v_dim)
         Fv_enhanced = self.text_guided_video_attention(Ft, Fv, vid_mask, text_mask)
-
+        # 压缩文本增强的视频特征 - (batch_size, compress_len, v_dim)
+        Fv_compress_enhanced, combined_weights = self.text_enhanced_memory_compressor(Fv_enhanced, mask=vid_mask)
+        
         if extern_weight is None:
-            # 压缩文本增强的视频特征 - (batch_size, compress_len, v_dim)
-            Fv_compress_enhanced, combined_weights = self.text_enhanced_memory_compressor(Fv_enhanced, mask=vid_mask)
-            
             # 压缩原始视频特征 - (batch_size, compress_len, v_dim)
             Fv_compress, _ = self.direct_memory_compressor(Fv, mask=vid_mask)
         else:
-            # 压缩文本增强的视频特征 - (batch_size, compress_len, v_dim)
-            Fv_compress_enhanced, combined_weights = self.text_enhanced_memory_compressor(Fv_enhanced, mask=vid_mask, extern_weight=extern_weight)
-            
             # 压缩原始视频特征 - (batch_size, compress_len, v_dim)
             Fv_compress, _ = self.direct_memory_compressor(Fv, mask=vid_mask, extern_weight=extern_weight)
 
@@ -411,6 +528,143 @@ class TextGuidedCompressor(nn.Module):
         )
 
         return feat, combined_weights
+
+class TextPresentGuidedCompressor(nn.Module):
+    """
+    基于文本和视觉引导的视频记忆压缩模块，使用门控机制融合两个分支的结果
+    
+    两个分支:
+    1. 文本引导分支: TextGuidedVideoAttention + SimpleCompressor
+    2. 视觉引导分支: PresentGuidedVideoAttention + SimpleCompressor
+    
+    输入:
+        Ft: 文本特征，形状为 (batch_size, num_token, t_dim)
+        Fg: 视觉引导特征，形状为 (batch_size, guide_vid_len, v_dim)
+        Fv: 视频特征，形状为 (batch_size, vid_len, v_dim)
+        vid_mask: 视频掩码，形状为 (batch_size, vid_len)
+        text_mask: 文本掩码，形状为 (batch_size, num_token)
+        
+    输出:
+        feat: 融合后的压缩视频特征，形状为 (batch_size, compress_len, v_dim)
+        mask: 压缩后的掩码，形状为 (batch_size, compress_len)
+    """
+    def __init__(self, t_dim, v_dim, hidden_dim=512, num_heads=8, dropout=0.1, compress_len=10):
+        """
+        初始化文本和视觉引导的视频压缩器
+        
+        参数:
+            t_dim: 文本特征维度
+            v_dim: 视频特征维度
+            hidden_dim: 注意力机制内部隐藏维度
+            num_heads: 多头注意力的头数
+            dropout: Dropout率
+            compress_len: 压缩后的序列长度
+        """
+        super().__init__()
+
+        self.compress_len = compress_len
+
+        # 文本引导视频注意力模块
+        self.text_guided_video_attention = TextGuidedVideoAttention(
+            t_dim=t_dim,
+            v_dim=v_dim,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout
+        )
+        
+        # 视觉引导视频注意力模块
+        self.present_guided_video_attention = PresentGuidedVideoAttention(
+            dim=v_dim,
+            hidden_dim=hidden_dim,
+            num_heads=num_heads,
+            dropout=dropout
+        )
+            
+        # 文本增强视频特征压缩器
+        self.text_enhanced_memory_compressor = SimpleCompressor(
+            v_dim, 
+            compress_len=compress_len,
+            num_heads=num_heads,
+            dropout=dropout
+        )
+        
+        # 视觉增强视频特征压缩器
+        self.present_enhanced_memory_compressor = SimpleCompressor(
+            v_dim, 
+            compress_len=compress_len,
+            num_heads=num_heads,
+            dropout=dropout
+        )
+        
+        # 文本增强特征门控 - 控制文本增强视频特征的贡献
+        self.text_enhanced_gate = nn.Sequential(
+            nn.Linear(v_dim, hidden_dim<<1),  # v_dim -> hidden_dim*2
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim<<1, 1),      # hidden_dim*2 -> 1
+            nn.Tanh(),
+            nn.GELU(),
+            nn.Dropout(0.4)
+        )
+        
+        # 视觉增强特征门控 - 控制视觉增强视频特征的贡献
+        self.present_enhanced_gate = nn.Sequential(
+            nn.Linear(v_dim, hidden_dim<<1),  # v_dim -> hidden_dim*2
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim<<1, 1),      # hidden_dim*2 -> 1
+            nn.Tanh(),
+            nn.GELU(),
+            nn.Dropout(0.4)
+        )
+        
+        # 添加层归一化
+        self.norm = nn.LayerNorm(v_dim, elementwise_affine=False)
+
+    def forward(self, Ft, Fg, Fv, vid_mask=None, text_mask=None):
+        """
+        前向传播
+        
+        参数:
+            Ft: 文本特征，形状为 (batch_size, num_token, t_dim)
+            Fg: 视觉引导特征，形状为 (batch_size, guide_vid_len, v_dim)
+            Fv: 视频特征，形状为 (batch_size, vid_len, v_dim)
+            vid_mask: 视频掩码，形状为 (batch_size, vid_len)
+            text_mask: 文本掩码，形状为 (batch_size, num_token)
+            
+        返回:
+            feat: 融合后的压缩视频特征，形状为 (batch_size, compress_len, v_dim)
+            mask: 压缩后的掩码，形状为 (batch_size, compress_len)
+        """
+        # 文本引导增强的视频特征 - (batch_size, vid_len, v_dim)
+        Fv_enhanced_text = self.text_guided_video_attention(Ft, Fv, vid_mask, text_mask)
+        
+        # 视觉引导增强的视频特征 - (batch_size, vid_len, v_dim)
+        Fv_enhanced_present = self.present_guided_video_attention(Fg, Fv, vid_mask)
+        
+        # 压缩文本增强的视频特征 - (batch_size, compress_len, v_dim)
+        Fv_compress_text, mask_text = self.text_enhanced_memory_compressor(Fv_enhanced_text, mask=vid_mask)
+        
+        # 压缩视觉增强的视频特征 - (batch_size, compress_len, v_dim)
+        Fv_compress_present, mask_present = self.present_enhanced_memory_compressor(Fv_enhanced_present, mask=vid_mask)
+
+        # 计算门控值
+        # 文本增强特征的门控值 - (batch_size, 1, 1)
+        text_enhanced_gate_value = self.text_enhanced_gate(Fv_compress_text.mean(1, keepdim=True))
+        
+        # 视觉增强特征的门控值 - (batch_size, 1, 1)
+        present_enhanced_gate_value = self.present_enhanced_gate(Fv_compress_present.mean(1, keepdim=True))
+
+        # --- 融合两个分支特征 ---
+        # text_enhanced_gate_value * Fv_compress_text - (batch_size, compress_len, v_dim)
+        # present_enhanced_gate_value * Fv_compress_present - (batch_size, compress_len, v_dim)
+        feat = self.norm(
+            text_enhanced_gate_value * Fv_compress_text + 
+            present_enhanced_gate_value * Fv_compress_present
+        )
+
+        return feat, mask_text
 
 class MultimodalTokenCompressor(nn.Module):
     def __init__(self, v_dim, compress_len, num_heads=8, dropout=0.1):
@@ -552,7 +806,7 @@ class CompressorWithExternalWeights(nn.Module):
         
     输出:
         Fv_compress: 压缩后的视频特征，形状为 (batch_size, compress_len, dimension)
-        combined_weights: 注意力权重与外部权重的平均，形状为 (batch_size, compress_len, vid_len)
+        mask: 压缩后的有效掩码，形状为 (batch_size, compress_len)
     """
 
     def __init__(self, dimension, compress_len, num_heads=8, dropout=0.1, weight_alpha=0.5):
@@ -1262,10 +1516,10 @@ class ResidualCompressor(CompressorWithExternalWeights):
         # Fv_residual = Fv_compress + self.residual_weight * padded_Fo
         Fv_residual = padded_Fo + self.residual_weight * Fv_compress
 
-        # 对于每个batch的结果，如果Fo长度小于等于compress_len，则直接返回未压缩的Fv，
+        # 对于每个batch的结果，如果Fo长度小于compress_len，则直接返回未压缩的Fv，
         # 并将mask根据Fo的长度重新设置：前len(Fo[i])个为有效，其余为无效
         for i in range(batch_size):
-            if Fo[i].shape[0] <= self.compress_len:
+            if Fo[i].shape[0] < self.compress_len:
                 Fv_residual[i] = Fv[i][:self.compress_len]
                 compress_mask[i] = torch.zeros(self.compress_len, dtype=torch.bool, device=device)
                 compress_mask[i][:len(Fo[i])] = True
@@ -1357,14 +1611,14 @@ class CrossAttentionResidualCompressor(CompressorWithExternalWeights):
                 padded_Fo[i] = Fo_list[i]
                 fo_mask[i] = torch.ones(self.compress_len, dtype=torch.bool, device=device)
         
-        # 4. 对于batch中Fo长度小于等于compress_len的样本，直接使用原始特征
+        # 4. 对于batch中Fo长度小于compress_len的样本，直接使用原始特征
         # 创建结果变量，初始为Fs
         Fv_residual = Fs.clone()
         special_cases = []
         
         for i in range(batch_size):
-            if Fo_list[i].shape[0] <= self.compress_len:
-                # 如果Fo长度小于等于compress_len，直接使用原始特征
+            if Fo_list[i].shape[0] < self.compress_len:
+                # 如果Fo长度小于compress_len，直接使用原始特征
                 Fv_residual[i, :Fo_list[i].shape[0]] = Fv[i][bool_mask[i]][-Fo_list[i].shape[0]:]
                 compress_mask[i] = torch.zeros(self.compress_len, dtype=torch.bool, device=device)
                 compress_mask[i][:Fo_list[i].shape[0]] = True
@@ -1372,6 +1626,8 @@ class CrossAttentionResidualCompressor(CompressorWithExternalWeights):
         
         # 如果所有batch都是特殊情况，直接返回结果
         if len(special_cases) == batch_size:
+            # print("\nAll batches are special cases")
+            # print("self.training:", self.training)
             return Fv_residual, compress_mask
         
         # 创建一个掩码，标记哪些batch需要进行交叉注意力计算
@@ -1469,6 +1725,7 @@ class CrossAttentionResidualCompressorWithQuery(TextGuidedCompressor):
         """
         super().__init__(t_dim=dimension,v_dim = dimension,hidden_dim=dimension, compress_len=compress_len, num_heads=num_heads, dropout=dropout, weight_alpha=weight_alpha)
         self.attn_weight = attn_weight  # δ参数，控制注意力结果的权重
+        self.num_heads = num_heads
         
         # 交叉注意力层的投影矩阵
         self.cross_q_proj = nn.Linear(dimension, dimension)
@@ -1531,7 +1788,7 @@ class CrossAttentionResidualCompressorWithQuery(TextGuidedCompressor):
         special_cases = []
         
         for i in range(batch_size):
-            if Fo_list[i].shape[0] <= self.compress_len:
+            if Fo_list[i].shape[0] < self.compress_len:
                 # 如果Fo长度小于等于compress_len，直接使用原始特征
                 Fv_residual[i, :Fo_list[i].shape[0]] = Fv[i][bool_mask[i]][-Fo_list[i].shape[0]:]
                 compress_mask[i] = torch.zeros(self.compress_len, dtype=torch.bool, device=device)
@@ -1547,6 +1804,10 @@ class CrossAttentionResidualCompressorWithQuery(TextGuidedCompressor):
         for idx in special_cases:
             batch_mask[idx] = False
         
+        # print("batch_mask:", batch_mask)
+        # print("batch_mask.any():", batch_mask.any())
+        # input("Press Enter to continue...")
+
         # 5. 对其余样本执行交叉注意力: Fo作为query，Fs作为key和value
         if batch_mask.any():
             # 筛选需要进行注意力计算的batch
@@ -1606,3 +1867,288 @@ class CrossAttentionResidualCompressorWithQuery(TextGuidedCompressor):
             Fv_residual[batch_mask] = filtered_residual
         
         return Fv_residual, compress_mask
+
+# 7. 拼接，compress_len长度的压缩结果，前半部分为压缩到compress_len/2的压缩结果，后半部分为最近的compress_len/2个视觉特征
+class ConcatCompressor(CompressorWithExternalWeights):
+    """
+    使用拼接的压缩模块
+    
+    压缩结果共compress_len长度，前半部分为压缩到compress_len/2的压缩结果，
+    后半部分为最近的compress_len/2个视觉特征
+    
+    输入:
+        Fv: 长期视频记忆特征，形状为 (batch_size, vid_len, dimension)
+        extern_weight: 外部提供的权重，形状为 (batch_size, vid_len)
+        mask: 有效位置的掩码，形状为 (batch_size, vid_len)
+        
+    输出:
+        Fv_concat: 拼接后的视频特征，形状为 (batch_size, compress_len, dimension)
+        compress_mask: 拼接后的掩码，形状为 (batch_size, compress_len)
+    """
+    def __init__(self, dimension, compress_len, num_heads=8, dropout=0.1, weight_alpha=0.5):
+        """
+        初始化拼接压缩模块
+        
+        参数:
+            dimension: 特征维度
+            compress_len: 拼接后的视频长度
+            num_heads: 多头注意力的头数
+            dropout: Dropout率
+            weight_alpha: 注意力权重和外部权重的融合比例
+        """
+        # 确保compress_len是偶数
+        if compress_len % 2 != 0:
+            raise ValueError("compress_len必须是偶数")
+            
+        # 调用父类初始化，但压缩长度为compress_len的一半
+        super().__init__(dimension, compress_len // 2, num_heads, dropout, weight_alpha)
+        
+    def forward(self, Fv, extern_weight=None, mask=None):
+        """
+        前向传播
+        
+        参数:
+            Fv: 长期视频记忆特征，形状为 (batch_size, vid_len, dimension)
+            extern_weight: 外部提供的权重，形状为 (batch_size, vid_len)
+            mask: 有效位置的掩码，形状为 (batch_size, vid_len)
+            
+        返回:
+            Fv_concat: 拼接后的视频特征，形状为 (batch_size, compress_len, dimension)
+            compress_mask: 拼接后的掩码，形状为 (batch_size, compress_len)
+        """
+        batch_size, vid_len, dimension = Fv.size()
+        device = Fv.device
+        half_compress_len = self.compress_len  # 实际压缩长度是总长度的一半
+        full_compress_len = half_compress_len * 2  # 最终长度
+        
+        # 1. 获取压缩的视频特征 Fs (前半部分)
+        Fs, compress_mask_half = super().forward(Fv, extern_weight, mask)
+        
+        # 2. 提取每个batch的最近compress_len/2个有效特征作为Fo
+        bool_mask = mask.bool() if mask is not None else torch.ones(batch_size, vid_len, dtype=torch.bool, device=device)
+        Fo_list = []
+        actual_fo_lengths = []
+        
+        for batch in range(batch_size):
+            # 获取当前批次的有效特征
+            valid_features = Fv[batch][bool_mask[batch]]
+            # 记录实际有效特征长度
+            valid_len = valid_features.shape[0]
+            actual_fo_lengths.append(min(valid_len, half_compress_len))
+            # 取最后compress_len/2个
+            Fo_list.append(valid_features[-half_compress_len:] if valid_len >= half_compress_len 
+                          else valid_features)
+        
+        # 3. 创建结果变量，初始化为零张量
+        Fv_concat = torch.zeros(batch_size, full_compress_len, dimension, device=device)
+        full_compress_mask = torch.zeros(batch_size, full_compress_len, dtype=torch.bool, device=device)
+        
+        # 4. 处理每个batch样本
+        for i in range(batch_size):
+            # 获取当前批次的有效特征总数
+            valid_features_count = bool_mask[i].sum().item()
+            
+            if valid_features_count < full_compress_len:
+                # 特殊情况：有效特征总数小于full_compress_len
+                # 直接使用原始的所有有效特征，pad到full_compress_len
+                valid_features = Fv[i][bool_mask[i]]
+                # 放入结果张量的前valid_features_count位置
+                Fv_concat[i, :valid_features_count] = valid_features
+                # 设置对应的mask
+                full_compress_mask[i, :valid_features_count] = True
+                # 其余位置保持为0和False（已初始化为这些值）
+            else:
+                # 正常情况：前半部分为压缩特征，后半部分为最近的特征
+                # 前半部分：压缩特征
+                Fv_concat[i, :half_compress_len] = Fs[i]
+                full_compress_mask[i, :half_compress_len] = compress_mask_half[i]
+                
+                # 后半部分：最近的half_compress_len个特征
+                Fv_concat[i, half_compress_len:] = Fo_list[i]
+                full_compress_mask[i, half_compress_len:] = True
+        
+        return Fv_concat, full_compress_mask
+
+class CrossAttentionConcatCompressor(CompressorWithExternalWeights):
+    """
+    使用交叉注意力的拼接压缩模块（改进版）
+    
+    压缩结果共compress_len长度，前半部分完全使用交叉注意力机制处理的结果 attn(Fo, Fs)，
+    交叉注意力用Fo指导对Fs的处理
+    后半部分仍为最近的compress_len/2个视觉特征
+    
+    输入:
+        Fv: 长期视频记忆特征，形状为 (batch_size, vid_len, dimension)
+        extern_weight: 外部提供的权重，形状为 (batch_size, vid_len)
+        mask: 有效位置的掩码，形状为 (batch_size, vid_len)
+        
+    输出:
+        Fv_concat: 拼接后的视频特征，形状为 (batch_size, compress_len, dimension)
+        compress_mask: 拼接后的掩码，形状为 (batch_size, compress_len)
+    """
+    def __init__(self, dimension, compress_len, num_heads=8, dropout=0.1, weight_alpha=0.5):
+        """
+        初始化拼接压缩模块
+        
+        参数:
+            dimension: 特征维度
+            compress_len: 拼接后的视频长度
+            num_heads: 多头注意力的头数
+            dropout: Dropout率
+            weight_alpha: 注意力权重和外部权重的融合比例
+        """
+        # 确保compress_len是偶数
+        if compress_len % 2 != 0:
+            raise ValueError("compress_len必须是偶数")
+            
+        # 调用父类初始化，但压缩长度为compress_len的一半
+        super().__init__(dimension, compress_len // 2, num_heads, dropout, weight_alpha)
+        
+        # 交叉注意力层的投影矩阵
+        self.cross_q_proj = nn.Linear(dimension, dimension)
+        self.cross_k_proj = nn.Linear(dimension, dimension)
+        self.cross_v_proj = nn.Linear(dimension, dimension)
+        
+        # 输出投影
+        self.cross_out_proj = nn.Linear(dimension, dimension)
+        
+        # Dropout
+        self.cross_dropout = nn.Dropout(dropout)
+
+    def forward(self, Fv, extern_weight=None, mask=None):
+        """
+        前向传播
+        
+        参数:
+            Fv: 长期视频记忆特征，形状为 (batch_size, vid_len, dimension)
+            extern_weight: 外部提供的权重，形状为 (batch_size, vid_len)
+            mask: 有效位置的掩码，形状为 (batch_size, vid_len)
+            
+        返回:
+            Fv_concat: 拼接后的视频特征，形状为 (batch_size, compress_len, dimension)
+            compress_mask: 拼接后的掩码，形状为 (batch_size, compress_len)
+        """
+        batch_size, vid_len, dimension = Fv.size()
+        device = Fv.device
+        half_compress_len = self.compress_len  # 实际压缩长度是总长度的一半
+        full_compress_len = half_compress_len * 2  # 最终长度
+        
+        # 1. 获取压缩的视频特征 Fs (前半部分的基础)
+        Fs, compress_mask_half = super().forward(Fv, extern_weight, mask)
+        
+        # 2. 提取每个batch的最近compress_len/2个有效特征作为Fo
+        bool_mask = mask.bool() if mask is not None else torch.ones(batch_size, vid_len, dtype=torch.bool, device=device)
+        Fo_list = []
+        actual_fo_lengths = []
+        
+        for batch in range(batch_size):
+            # 获取当前批次的有效特征
+            valid_features = Fv[batch][bool_mask[batch]]
+            # 记录实际有效特征长度
+            valid_len = valid_features.shape[0]
+            actual_fo_lengths.append(min(valid_len, half_compress_len))
+            # 取最后compress_len/2个
+            Fo_list.append(valid_features[-half_compress_len:] if valid_len >= half_compress_len 
+                          else valid_features)
+        
+        # 3. 创建Fo的填充张量
+        padded_Fo = torch.zeros(batch_size, half_compress_len, dimension, device=device)
+        fo_mask = torch.zeros(batch_size, half_compress_len, dtype=torch.bool, device=device)
+        
+        for i in range(batch_size):
+            fo_len = Fo_list[i].shape[0]
+            # 填充Fo
+            if fo_len < half_compress_len:
+                padded_Fo[i, :fo_len] = Fo_list[i]
+                fo_mask[i, :fo_len] = True
+            else:
+                padded_Fo[i] = Fo_list[i]
+                fo_mask[i] = torch.ones(half_compress_len, dtype=torch.bool, device=device)
+        
+        
+        # 4. 创建结果变量，初始化为零张量
+        Fv_concat = torch.zeros(batch_size, full_compress_len, dimension, device=device)
+        full_compress_mask = torch.zeros(batch_size, full_compress_len, dtype=torch.bool, device=device)
+        
+        # 5. 处理特殊情况：有效特征总数小于full_compress_len
+        special_cases = []
+        for i in range(batch_size):
+            # 获取当前批次的有效特征总数
+            valid_features_count = bool_mask[i].sum().item()
+            
+            if valid_features_count < full_compress_len:
+                # 特殊情况：有效特征总数小于full_compress_len
+                # 直接使用原始的所有有效特征，pad到full_compress_len
+                valid_features = Fv[i][bool_mask[i]]
+                # 放入结果张量的前valid_features_count位置
+                Fv_concat[i, :valid_features_count] = valid_features
+                # 设置对应的mask
+                full_compress_mask[i, :valid_features_count] = True
+                # 记录特殊情况的batch索引
+                special_cases.append(i)
+        # 创建一个掩码，标记哪些batch需要进行交叉注意力计算
+        batch_mask = torch.ones(batch_size, dtype=torch.bool, device=device)
+        for idx in special_cases:
+            batch_mask[idx] = False
+
+        # 6. 对非特殊情况的样本执行交叉注意力计算
+        if batch_mask.any():
+            # 筛选需要进行注意力计算的batch
+            filtered_Fo = padded_Fo[batch_mask]
+            filtered_Fs = Fs[batch_mask]
+            filtered_fo_mask = fo_mask[batch_mask]
+            
+            # 交叉注意力计算 - Fo作为query，Fs作为key和value
+            # 6.1 投影query, key, value
+            q = self.cross_q_proj(filtered_Fo)  # (filtered_batch_size, half_compress_len, dimension)
+            k = self.cross_k_proj(filtered_Fs)  # (filtered_batch_size, half_compress_len, dimension)
+            v = self.cross_v_proj(filtered_Fs)  # (filtered_batch_size, half_compress_len, dimension)
+            
+            # 6.2 分割多头
+            filtered_batch_size = filtered_Fo.size(0)
+            head_dim = dimension // self.num_heads
+            
+            # 重塑为多头格式
+            q = q.view(filtered_batch_size, -1, self.num_heads, head_dim).transpose(1, 2)
+            k = k.view(filtered_batch_size, -1, self.num_heads, head_dim).transpose(1, 2)
+            v = v.view(filtered_batch_size, -1, self.num_heads, head_dim).transpose(1, 2)
+            
+            # 6.3 计算注意力分数
+            scores = torch.matmul(q, k.transpose(-1, -2)) / math.sqrt(head_dim)
+            
+            # 应用Fo的掩码（确保填充部分不参与注意力计算）
+            if filtered_fo_mask is not None:
+                # 扩展掩码以适应多头注意力的形状
+                q_mask = filtered_fo_mask.unsqueeze(1).unsqueeze(-1)
+                # 在无效查询位置应用大的负值
+                scores = scores.masked_fill(~q_mask.bool(), -1e9)
+            
+            # 应用softmax得到注意力权重
+            attn_weights = F.softmax(scores, dim=-1)
+            attn_weights = self.cross_dropout(attn_weights)
+            
+            # 6.4 计算加权和
+            weighted_v = torch.matmul(attn_weights, v)
+            
+            # 6.5 合并多头结果
+            weighted_v = weighted_v.transpose(1, 2).contiguous()
+            weighted_v = weighted_v.view(filtered_batch_size, half_compress_len, dimension)
+            
+            # 6.6 应用输出投影
+            attn_output = self.cross_out_proj(weighted_v)
+            
+            # 6.7 使用交叉注意力的输出作为前半部分特征
+            # 这里直接使用attn_output，而不是残差连接
+            first_half_features = attn_output
+            
+            # 将结果放入最终拼接张量
+            for idx, orig_idx in enumerate(torch.where(batch_mask)[0]):
+                # 前半部分：通过交叉注意力处理的特征
+                Fv_concat[orig_idx, :half_compress_len] = first_half_features[idx]
+                full_compress_mask[orig_idx, :half_compress_len] = filtered_fo_mask[idx]
+                
+                # 后半部分：最近的half_compress_len个特征
+                Fv_concat[orig_idx, half_compress_len:] = padded_Fo[orig_idx]
+                full_compress_mask[orig_idx, half_compress_len:] = fo_mask[orig_idx]
+        
+        return Fv_concat, full_compress_mask

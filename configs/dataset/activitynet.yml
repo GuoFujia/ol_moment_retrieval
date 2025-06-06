@@ -5,8 +5,10 @@ eval_path:  /home/gfj/lighthouse-main/data/activitynet/activitynet_val_release.j
 
 short_memory_len : 8
 long_memory_sample_len: 64
-# long_memory_sample_len: 16
-future_memory_sample_len: 0
+future_memory_sample_len: 16
+
+weight_alpha: 0.5
+attn_weight: 0.3
 
 lr: 0.0005 # 0.0001-> AdamW，和bsz等比例调整
 # lr_drop: 40
@@ -18,5 +20,6 @@ max_q_l: 100
 # eval_epoch_interval: 2
 
 use_vid_compression: True
+use_inter_memory: True
 
 compress_len: 16

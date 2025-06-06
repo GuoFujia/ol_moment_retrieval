@@ -46,10 +46,10 @@ class BaseOptions(object):
             self.opt.update(yml)
 
     def parse(self):
-        base_cfg = '../configs/base.yml'
-        feature_cfg = f'../configs/feature/{self.feature}.yml'
-        model_cfg = f'../configs/model/{self.model}.yml'
-        dataset_cfg = f'../configs/dataset/{self.dataset}.yml'
+        base_cfg = '/home/gfj/lighthouse-main/configs/base.yml'
+        feature_cfg = f'/home/gfj/lighthouse-main/configs/feature/{self.feature}.yml'
+        model_cfg = f'/home/gfj/lighthouse-main/configs/model/{self.model}.yml'
+        dataset_cfg = f'/home/gfj/lighthouse-main/configs/dataset/{self.dataset}.yml'
         cfgs = [base_cfg, feature_cfg, model_cfg, dataset_cfg]
         for cfg in cfgs:
             self.update(cfg)

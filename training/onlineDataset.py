@@ -103,7 +103,7 @@ class StartEndDataset(Dataset):
         
         # data
         self.data = self.load_data()
-        # sample_size = len(self.data) // 16
+        # sample_size = len(self.data) // 4
         # self.data = random.sample(self.data, sample_size)  # 随机抽取
         # self.data = self.data[:sample_size] # 只取前sample_size个
         self.load_saliency_scores() 
@@ -600,6 +600,8 @@ class StartEndDataset(Dataset):
             # if self.long_memory_sample_length > 0:
             model_inputs["video_feat_long"]=whole_video_feature[long_memory_start:long_memory_end:self.long_memory_stride]  
             ctx_l_long=len(model_inputs["video_feat_long"])
+            model_inputs["qid_vid"] = [chunk_info['qid'], chunk_info['vid']]
+            model_inputs["short_memory_start"] = short_memory_start
             if not self.test_mode:
                 # 从 mid_label_dict 获取权重
                 vid, qid = chunk_info['vid'], chunk_info['qid']
@@ -612,9 +614,7 @@ class StartEndDataset(Dataset):
                     # 当long_memory_weights长度不为0时，将显著性分数归一化到0-1
                     long_memory_weights = long_memory_weights / 4
                 model_inputs["long_memory_weight"] = torch.tensor(long_memory_weights)
-            else:
-                model_inputs["qid_vid"] = [chunk_info['qid'], chunk_info['vid']]
-                model_inputs["short_memory_start"] = short_memory_start
+
 
             # # train/val均从数据集获得外部权重，评估upbound
             # # 从 mid_label_dict 获取权重

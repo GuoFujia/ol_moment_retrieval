@@ -64,13 +64,15 @@ def write_log(opt, epoch_i, loss_meters, metrics=None, mode='train'):
     with open(filename, "a") as f:
         f.write(to_write)
 
-def save_checkpoint(model, optimizer, lr_scheduler, epoch_i, opt):
+def save_checkpoint(model, optimizer, lr_scheduler, epoch_i, opt, inter_memory_update_cnt=None, memory_optimizer=None):
     checkpoint = {
         "model": model.state_dict(),
         "optimizer": optimizer.state_dict(),
         "lr_scheduler": lr_scheduler.state_dict(),
         "epoch": epoch_i,
-        "opt": opt
+        "opt": opt,
+        "inter_memory_update_cnt": inter_memory_update_cnt,
+        "memory_optimizer": memory_optimizer
     }
     torch.save(checkpoint, opt.ckpt_filepath)
 

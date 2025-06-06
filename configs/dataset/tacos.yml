@@ -10,8 +10,7 @@ eval_bsz: 32
 
 short_memory_len : 8
 long_memory_sample_len: 64
-# long_memory_sample_len: 16
-future_memory_sample_len: 0
+future_memory_sample_len: 16
 
 lw_saliency: 4
 lr: 0.0005  #0.0002
@@ -20,6 +19,10 @@ lr_drop: 40
 # eval_epoch_interval: 2
 
 use_vid_compression: True
+use_inter_memory: True
 
 compress_len: 16
-# compress_len: 64
+# compress_len: 32
+
+weight_alpha: 0.5
+attn_weight: 0.5

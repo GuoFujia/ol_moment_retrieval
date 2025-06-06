@@ -295,6 +295,10 @@ def get_eval_res(epoch_i, model, eval_loader, opt, criterion):
 def eval_epoch(epoch_i, model, eval_dataset, opt, save_submission_filename, criterion=None):
     logger.info("Generate submissions")
     model.eval()
+
+    if model.use_inter_memory and model.future_memory_sample_len > 0:
+        print("before validation, interMemory has updated for ", model.inter_memory.getUpdateCnt(), " times.")
+
     if criterion is not None:
         criterion.eval()
 
@@ -366,6 +370,12 @@ def setup_model(opt):
             checkpoint = torch.load(opt.model_path, map_location=opt.device)
             # 将权重加载到模型中
             model.load_state_dict(checkpoint['model'], strict=False)  # strict=False 允许部分加载
+            if model.use_inter_memory and model.future_memory_sample_len > 0:
+                # model.inter_memory.setInterMemory(memory=checkpoint['inter_memory'], future_embedding=checkpoint['future_embedding'], updateCnt=checkpoint['inter_memory_update_cnt'])
+                model.inter_memory.setInterMemory(updateCnt=checkpoint['inter_memory_update_cnt'])
+                model.inter_memory.memory_optimizer.load_state_dict(checkpoint['memory_optimizer'])
+                model.inter_memory.memory = model.inter_memory.memory.requires_grad_()
+
             logger.info("Model weights loaded successfully (strict=False).")
         except Exception as e:
             logger.error(f"Failed to load model weights: {e}")
@@ -379,9 +389,9 @@ def setup_model(opt):
             if "transformer" in name:  # 冻结所有 transformer 相关的参数
                 param.requires_grad = False
                 logger.info(f"Froze parameter: {name}")
-
+    
     # 设置优化器和学习率调度器
-    param_dicts = [{"params": [p for n, p in model.named_parameters() if p.requires_grad]}]
+    param_dicts = [{"params": [p for n, p in model.named_parameters() if (p.requires_grad and n != "inter_memory")]}]
     optimizer = torch.optim.AdamW(param_dicts, lr=opt.lr, weight_decay=opt.wd)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, opt.lr_drop)
 
@@ -429,7 +439,6 @@ def start_inference(opt, domain=None):
     # eval_dataset = CGDETR_StartEndDataset(**dataset_config) if opt.model_name == 'cg_detr' else StartEndDataset(**dataset_config)
     eval_dataset = StartEndDataset(**dataset_config)
     model, criterion, _, _ = setup_model(opt)
-
     
     logger.info("Model checkpoint: {}".format(opt.model_path))
     if not load_labels:
