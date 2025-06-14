@@ -80,6 +80,22 @@ def check_label_generation(dataset):
     print("\n标签生成检查:")
     flag = 1
     i = 0 
+    # 统计每个样本的gt_frames_in_long_memory属性值
+    num_gt_frames_in_long_memory = []
+    for i in range(len(dataset.chunk_infos)):
+        chunk_info = dataset.chunk_infos[i]
+        num_gt_frames_in_long_memory.append(chunk_info['gt_frames_in_long_memory'])
+    print(f"平均: {np.mean(num_gt_frames_in_long_memory):.1f}")
+    print(f"最小: {min(num_gt_frames_in_long_memory)}")
+    print(f"最大: {max(num_gt_frames_in_long_memory)}")
+    # 计算中位数，上三分位数和上四分位数
+    print(f"中位数: {np.median(num_gt_frames_in_long_memory)}")
+    print(f"67%位数: {np.percentile(num_gt_frames_in_long_memory, 67)}")
+    print(f"80%位数: {np.percentile(num_gt_frames_in_long_memory, 80)}")
+    # 再打印分别等于0-max的样本数量
+    for i in range(0, max(num_gt_frames_in_long_memory) + 1):
+        print(f"等于 {i} 的样本数量: {sum(1 for x in num_gt_frames_in_long_memory if x == i)}")
+    
     # while flag:
     #     chunk_info = dataset.chunk_infos[i]
     #     print(f"\n样本 {i}:")
@@ -126,7 +142,7 @@ def check_data_distribution(dataset):
 
 if __name__ == "__main__":
 
-    dataset = 'activitynet'
+    dataset = 'qvhighlight'
     feature = 'clip_slowfast'
 
     # feature directory
@@ -156,10 +172,11 @@ if __name__ == "__main__":
     t_feat_dir = os.path.join(base_path, t_feat_dir)
   
     dataset = StartEndDataset(
-        dset_name="activitynet",
+        dset_name="qvhighlight",
+        data_path="/home/gfj/lighthouse-main/data/qvhighlight/highlight_train_release.jsonl",
         # data_path="/home/gfj/lighthouse-main/data/qvhighlight/highlight_val_release.jsonl",
         # data_path="/home/gfj/lighthouse-main/data/tacos/tacos_val_release.jsonl",
-        data_path="/home/gfj/lighthouse-main/data/activitynet/activitynet_train_release.jsonl",
+        # data_path="/home/gfj/lighthouse-main/data/activitynet/activitynet_train_release.jsonl",
         v_feat_dirs=v_feat_dirs,
         q_feat_dir=t_feat_dir,
         short_memory_sample_length=8,

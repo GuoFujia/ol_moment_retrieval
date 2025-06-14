@@ -1164,6 +1164,14 @@ class InterMemorySeq(nn.Module):
             batch_first=True
         )
 
+        # 简单分类器 - MLP，用于判断输入特征是否更新
+        self.classifier = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(d_model, 1)
+        )
+
         # 内部优化器，用于优化记忆多样性
         self.memory_optimizer = torch.optim.Adam([self.memory], lr=optimizer_lr)
             
@@ -1185,6 +1193,21 @@ class InterMemorySeq(nn.Module):
             self.future_embedding = future_embedding
         if updateCnt is not None:
             self.updateCnt = updateCnt
+
+    def classify(self, x):
+        """
+        分类方法，直接返回0/1结果
+        推理的时候调用，可以在之前加个 with torch.no_grad():
+
+        Args:
+            x: [batch_size, seq_length, d_model]
+        
+        Returns:
+            predictions: [batch_size] 0/1分类结果
+        """
+        pooled = torch.mean(x, dim=1)
+        logits = self.classifier(pooled).squeeze(-1)
+        return (torch.sigmoid(logits) > 0.5).long()
 
     def compute_diversity_loss_negCos(self):
         """
@@ -2033,6 +2056,103 @@ class InterMemorySeq(nn.Module):
         if torch.isnan(self.memory).any():
             print("Warning: Memory contains NaN after update")
 
+    def update_memory_normal_gtframes(self, features, gt_frames_in_long_memory, mask=None, short_start=None, vid=None):
+        """
+        根据历史特征中和gt相交的帧数量/分类器输出决定是否更新
+        更新的记忆槽仍基于相似度（topk）
+        使用注意力机制融合信息到相似度高的记忆槽
+        
+        Args:
+            features: 输入特征，形状为 [batch_size, seq_length, d_model]
+            gt_frames_in_long_memory: 历史帧与GT窗口相交的帧数量，形状为[batch_size]
+            mask: 特征有效性掩码，形状为 [batch_size, seq_length]，1表示有效，0表示无效
+                    如果为None，则视所有特征为有效
+            short_start: 
+            vid: 这两个暂时用不到了，先留着
+        """
+        self.updateCnt += 1
+        batch_size, seq_length, _ = features.shape
+        device = features.device
+        
+        # 如果没有提供mask，则默认所有特征都有效
+        if mask is None:
+            mask = torch.ones(batch_size, seq_length, device=device, dtype=torch.bool)
+        else:
+            if mask.dtype != torch.bool:
+                mask = mask.bool()
+        
+        # 计算输入特征与记忆槽的相似度
+        similarities = self.compute_sequence_similarity_frobenius(features, mask)  # [batch_size, memory_slots]
+        # similarities = self.compute_sequence_similarity_hybrid_pool(features, mask)  # [batch_size, memory_slots]
+        # similarities = self.compute_sequence_similarity_multi_scale(features, mask)  # [batch_size, memory_slots]
+
+        # 统计每个样本输入，多少个记忆槽进行了更新
+        update_per_sample = torch.zeros(batch_size, device=device, dtype=torch.int32)
+
+        # 逐批次处理更新
+        for b in range(batch_size):
+            # 检查当前样本是否有有效特征
+            if not mask[b].any():
+                continue
+                
+            # 判断当前样本是否需要更新,如果当前样本的相交帧数量小于7（中位数），则不更新
+            if gt_frames_in_long_memory[b] < 7:
+                continue
+            
+            # 获取当前样本的特征和掩码
+            batch_features = features[b].unsqueeze(0)  # [1, seq_length, d_model]
+            batch_mask = mask[b].unsqueeze(0)  # [1, seq_length]
+            
+            # 找出相似度最高的k个记忆槽
+            similarity = similarities[b]  # [memory_slots]
+            # 找出相似度最高的k个记忆槽
+            topk_indices = torch.topk(similarity, k=topk, largest=True).indices
+            
+            # 更新所选记忆槽
+            for idx in topk_indices:
+                # 增加使用计数
+                self.slot_usage_counter[idx] += 1
+                
+                # 获取当前记忆槽
+                current_memory = self.memory[idx].unsqueeze(0)  # [1, slot_len, d_model]
+                
+                # 准备注意力掩码
+                if not batch_mask.all():
+                    attn_mask = batch_mask.float()
+                    attn_mask = attn_mask.masked_fill(attn_mask == 0, float('-1e9'))
+                    attn_mask = attn_mask.masked_fill(attn_mask == 1, 0.0)
+                    attn_mask = attn_mask.unsqueeze(1).expand(-1, self.slot_len, -1)
+                    attn_mask = attn_mask.repeat_interleave(self.num_heads, dim=0)
+                else:
+                    attn_mask = None
+                
+                # 使用交叉注意力机制更新记忆
+                updated_memory, _ = self.memory_update_attention(
+                    query=current_memory,        # [1, slot_len, d_model]
+                    key=batch_features,          # [1, seq_length, d_model]
+                    value=batch_features,        # [1, seq_length, d_model]
+                    attn_mask=attn_mask          # [num_heads, slot_len, seq_length] or None
+                )
+                
+                # 使用门控机制控制更新比例
+                concat_memory = torch.cat([current_memory, updated_memory], dim=-1)  # [1, slot_len, 2*d_model]
+                update_gate = torch.sigmoid(self.update_gate(concat_memory))  # [1, slot_len, d_model]
+                
+                # 应用门控更新
+                new_memory = current_memory * (1 - update_gate) + updated_memory * update_gate
+                
+                # 更新记忆槽
+                self.memory.data[idx] = new_memory.squeeze(0)
+
+        # 打印相似度最大值和平均值
+        print("Similarity max:", similarities.max())
+        print("Similarity mean:", similarities.mean())
+
+        # 检查是否存在NaN值
+        if torch.isnan(self.memory).any():
+            print("Warning: Memory contains NaN after update")
+
+
     def read_memory(self, query_features, mask=None):
         """
         从所有记忆槽中读取信息并平均结果
@@ -2162,14 +2282,14 @@ class InterMemorySeq(nn.Module):
         # 2. 预测未来特征
         future_features, future_mask = self.predict_future(history_features, current_features, mask)
         
-        # 3. 增加forward计数器并检查是否需要执行多样性优化
-        self.forward_counter += 1
-        if (self.forward_counter % self.optimization_interval == 0):
-            with open("interMemory_Optimization.log", 'a') as f:
-                f.write(f"\n--- Performing memory diversity optimization (step {self.forward_counter}) ---\n")
-            print(f"\n--- Performing memory diversity optimization (step {self.forward_counter}) ---")
+        # # 3. 增加forward计数器并检查是否需要执行多样性优化
+        # self.forward_counter += 1
+        # if (self.forward_counter % self.optimization_interval == 0):
+        #     with open("interMemory_Optimization.log", 'a') as f:
+        #         f.write(f"\n--- Performing memory diversity optimization (step {self.forward_counter}) ---\n")
+        #     print(f"\n--- Performing memory diversity optimization (step {self.forward_counter}) ---")
             
-            self.optimize_memory_diversity()
+        #     self.optimize_memory_diversity()
         
         return future_features, future_mask
 

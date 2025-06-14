@@ -108,36 +108,11 @@ class StartEndDataset(Dataset):
         # self.data = self.data[:sample_size] # 只取前sample_size个
         self.load_saliency_scores() 
 
-        # if ("tsOkWgzgW-o_60.0_210.0", 9539) in self.saliency_scores_list:
-        #     print("after load saliency scores for train: ", self.saliency_scores_list[("tsOkWgzgW-o_60.0_210.0", 9539)])
-        # if ("A_MFAuOwK5k_60.0_210.0", 6083) in self.saliency_scores_list:
-        #     print("after load saliency scores for test: ", self.saliency_scores_list[("A_MFAuOwK5k_60.0_210.0", 6083)])
-        # input("Press Enter to continue...")
-
         # 高斯标签
         self.st_label_dict, self.mid_label_dict, self.end_label_dict = self.load_all_gaussian_label_dict()
-        # if ("tsOkWgzgW-o_60.0_210.0", 9539) in self.st_label_dict:
-        #     print("after load gaussian labels for train, st is: ", self.st_label_dict[("tsOkWgzgW-o_60.0_210.0",9539)])
-        # if ("tsOkWgzgW-o_60.0_210.0", 9539) in self.mid_label_dict:
-        #     print("after load gaussian labels for train, mid is: ", self.mid_label_dict[("tsOkWgzgW-o_60.0_210.0",9539)])
-        # if ("tsOkWgzgW-o_60.0_210.0", 9539) in self.end_label_dict:
-        #     print("after load gaussian labels for train, end is: ", self.end_label_dict[("tsOkWgzgW-o_60.0_210.0",9539)])
-
-        # if ("A_MFAuOwK5k_60.0_210.0", 6083) in self.st_label_dict:
-        #     print("after load gaussian labels for test, st is: ", self.st_label_dict[("A_MFAuOwK5k_60.0_210.0",6083)])
-        # if ("A_MFAuOwK5k_60.0_210.0", 6083) in self.mid_label_dict:
-        #     print("after load gaussian labels for test, mid is: ", self.mid_label_dict[("A_MFAuOwK5k_60.0_210.0",6083)])
-        # if ("A_MFAuOwK5k_60.0_210.0", 6083) in self.end_label_dict:
-        #     print("after load gaussian labels for test, end is: ", self.end_label_dict[("A_MFAuOwK5k_60.0_210.0",6083)])
 
         # 分块信息
         self.chunk_infos = self.chunk_all_videos()[0]
-        # for chunk in self.chunk_infos:
-        #     if chunk['qid'] == 9539:
-        #         print(chunk)
-        #     if chunk['qid'] == 6083:
-        #         print(chunk)
-        # input("Press Enter to continue...")
 
         # 创建(索引, short_memory_start, qid)的元组列表
         indexed_data = [(i, item['short_memory_start'], item['qid']) for i, item in enumerate(self.chunk_infos)]
@@ -235,6 +210,43 @@ class StartEndDataset(Dataset):
                     all_vid_scores[start_frame:end_frame] = 1
                 
                 self.saliency_scores_list[(line["vid"], line["qid"])] = all_vid_scores
+
+    def calculate_gt_frames_in_long_memory(self, short_memory_start, gt_windows, long_memory_sample_length):
+        """计算历史帧与GT窗口相交的帧数量
+        
+        Args:
+            short_memory_start (int): 当前chunk的起始位置，也是历史帧的结束位置
+            gt_windows (list): GT窗口列表，每个窗口格式为[start, end)，左闭右开
+            long_memory_sample_length (int): 历史帧的最大长度
+        
+        Returns:
+            int: 历史帧与所有GT窗口相交的帧数量总和
+        """
+        # 计算历史帧的范围 [long_memory_start, short_memory_start)
+        long_memory_start = max(0, short_memory_start - long_memory_sample_length)
+        long_memory_end = short_memory_start
+        
+        # 如果历史帧长度为0，直接返回0
+        if long_memory_start >= long_memory_end:
+            return 0
+        
+        total_intersection_frames = 0
+        
+        # 遍历所有GT窗口，计算与历史帧的相交帧数
+        for gt_start, gt_end in gt_windows:
+            # 计算两个区间的交集长度
+            # 区间1: [long_memory_start, long_memory_end)
+            # 区间2: [gt_start, gt_end)
+            intersection_start = max(long_memory_start, gt_start)
+            intersection_end = min(long_memory_end, gt_end)
+            
+            # 如果有交集，累加交集长度
+            if intersection_start < intersection_end:
+                intersection_frames = intersection_end - intersection_start
+                total_intersection_frames += intersection_frames
+        
+        return total_intersection_frames
+
 
     def chunk_all_videos(self):
         """分块所有视频并生成软标签
@@ -351,6 +363,14 @@ class StartEndDataset(Dataset):
                         "short_memory_start": short_memory_start
                     }
 
+                    # 计算历史帧与GT窗口相交的帧数量
+                    gt_frames_in_long_memory = self.calculate_gt_frames_in_long_memory(
+                        short_memory_start, 
+                        gt_windows, 
+                        self.long_memory_sample_length
+                    )
+                    chunk_info["gt_frames_in_long_memory"] = gt_frames_in_long_memory
+
                     # 生成软标签
                     chunk_labels = self.get_chunk_labels(chunk_info)
                     if chunk_labels is None:
@@ -406,7 +426,8 @@ class StartEndDataset(Dataset):
             
             required_keys = {
                 'start_label', 'middle_label', 'end_label',
-                'saliency_pos_labels', 'saliency_neg_labels'
+                'saliency_pos_labels', 'saliency_neg_labels',
+                'gt_frames_in_long_memory'
             }
             if not all(k in chunk_info for k in required_keys):
                 print(f"Warning: chunk_infos[{i}] missing required keys. Skipping.")
@@ -462,59 +483,6 @@ class StartEndDataset(Dataset):
         # gt_mask = (t >= s_gt) & (t < e_gt)
         # se_label[gt_mask] = 1.0
         return {'start': s_label, 'middle': se_label, 'end': e_label}
-
-    # def generate_gaussian_labels(self, video_length, start_idx, end_idx):
-    #     """生成非对称和截断高斯的标签（左闭右开区间 [start_idx, end_idx)）"""
-    #     # 单帧事件处理（start_idx == end_idx-1）
-    #     if start_idx == end_idx - 1:
-    #         min_sigma = 1.0
-    #         t = torch.arange(video_length, dtype=torch.float)
-    #         return {
-    #             'start': torch.exp(-((t - start_idx) ** 2) / (2 * min_sigma ** 2)),
-    #             'middle': torch.exp(-((t - (start_idx+0.5)) ** 2) / (2 * min_sigma ** 2)),  # 中点
-    #             'end': torch.exp(-((t - (end_idx-1)) ** 2) / (2 * min_sigma ** 2))
-    #         }
-
-    #     # 基础参数
-    #     t = torch.arange(video_length, dtype=torch.float)
-    #     duration = end_idx - start_idx  # 左闭右开区间的长度
-    #     middle_idx = start_idx + duration / 2  # 精确中点
-
-    #     # ---- 1. 设置扩展系数 ----
-    #     extension_ratio = 1.5
-
-    #     # ---- 2. 截断高斯语义标签 ----
-    #     sigma_m = self.alpha_m * duration * extension_ratio
-    #     y_m = torch.exp(-((t - middle_idx) ** 2) / (2 * sigma_m ** 2))
-        
-    #     # GT区间内强制为1（左闭右开）
-    #     gt_mask = (t >= start_idx) & (t < end_idx)
-    #     y_m[gt_mask] = 1.0
-
-    #     # ---- 3. 非对称开始/结束标签 ----
-    #     # 对start_idx使用左闭右开逻辑
-    #     y_s = self._asymmetric_gaussian(t, start_idx, duration, 'start')
-    #     # 对end_idx-1使用左闭右开逻辑（因为end_idx是开区间）
-    #     y_e = self._asymmetric_gaussian(t, end_idx-1, duration, 'end')
-
-    #     return {'start': y_s, 'middle': y_m, 'end': y_e}
-
-    # def _asymmetric_gaussian(self, t, mu, duration, label_type):
-    #     """生成非对称高斯标签（调整为左闭右开逻辑）"""
-    #     ratio_ori = 0.1
-    #     ratio_new = 0.3
-    #     if label_type == 'start':
-    #         mask = (t < mu)
-    #         ratio_ori *= -1
-    #         ratio_new *= -1
-    #     else:  # end
-    #         mask = (t > mu)
-        
-    #     sigma = self.alpha_s * duration if label_type == 'start' else self.alpha_e * duration
-    #     s_ori = ratio_ori * (mu - t) + sigma
-    #     s_new = ratio_new * (t - mu) + sigma
-    #     s = torch.where(mask, s_ori, s_new)
-    #     return torch.exp(-((t - mu) ** 2) / (2 * s ** 2))
 
     def get_chunk_labels(self, chunk_info):
         """获取当前chunk的标签，考虑多个GT片段
@@ -673,6 +641,9 @@ class StartEndDataset(Dataset):
         model_inputs["saliency_pos_labels"] = chunk_info["saliency_pos_labels"]
         model_inputs["saliency_neg_labels"] = chunk_info["saliency_neg_labels"]
         model_inputs["saliency_all_labels"] = chunk_info["saliency_all_labels"]
+
+        # 历史帧与GT窗口的交集长度
+        model_inputs["gt_frames_in_long_memory"] = chunk_info["gt_frames_in_long_memory"]
         
         # if chunk_info["qid"] == 9539:
         #     print("wait! check a sample for model input")
@@ -874,7 +845,8 @@ def start_end_collate_ol(batch, long_memory_sample_length = None):
     # 检查所有必需的键是否存在
     required_keys = {
         'start_label', 'middle_label', 'end_label',
-        'saliency_pos_labels', 'saliency_neg_labels', 'saliency_all_labels'
+        'saliency_pos_labels', 'saliency_neg_labels', 'saliency_all_labels',
+        'gt_frames_in_long_memory'
     }
     valid_indices = []
     for idx, inputs in enumerate(model_inputs_list):
@@ -897,7 +869,7 @@ def start_end_collate_ol(batch, long_memory_sample_length = None):
         if k in ["saliency_pos_labels", "saliency_neg_labels", "chunk_idx", "short_memory_start"]:
             batched_model_inputs[k] = torch.LongTensor([model_inputs_list[i][k] for i in valid_indices])
             continue
-        if k == "qid_vid":
+        if k == "qid_vid" or k == "gt_frames_in_long_memory":
             batched_model_inputs[k] = [model_inputs_list[i][k] for i in valid_indices]  # 保持原样
             continue
         if k in ["saliency_all_labels"]:
@@ -1010,7 +982,8 @@ def prepare_batch_inputs(metas, batched_model_inputs, device, non_blocking=False
     targets = {}
     label_keys = [
         'start_label', 'middle_label', 'end_label',"short_memory_start",
-        'saliency_pos_labels', 'saliency_neg_labels', 'saliency_all_labels'
+        'saliency_pos_labels', 'saliency_neg_labels', 'saliency_all_labels',
+        'gt_frames_in_long_memory'
     ]
     for key in label_keys:
         if key in batched_model_inputs:

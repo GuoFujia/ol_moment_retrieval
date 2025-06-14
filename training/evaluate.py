@@ -202,8 +202,8 @@ def compute_hl_results(epoch_i, model, eval_loader, opt, criterion=None):
     return submmission, loss_meters
 
 
-@torch.no_grad()
-def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
+# @torch.no_grad()
+def compute_mr_results(epoch_i, model, eval_loader, opt, optimizer, criterion=None):
     # batch_input_fn = cg_detr_prepare_batch_inputs if opt.model_name == 'cg_detr' else prepare_batch_inputs_ol
     batch_input_fn = prepare_batch_inputs_ol
 
@@ -211,8 +211,8 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
 
     mr_res = []
     # print(f"[DEBUG] Starting compute_mr_results with {len(eval_loader)} batches")
-    for batch in tqdm(eval_loader, desc="compute probability for each frame as st ed or mid"):
-         # batch 是一个元组，包含 metas 和 model_inputs
+    for batch_idx, batch in tqdm(enumerate(eval_loader), desc="compute probability for each frame as st ed or mid"):
+        # batch 是一个元组，包含 metas 和 model_inputs
 
         metas, batched_inputs = batch  # 解包 batch
         model_inputs, targets = batch_input_fn(metas, batched_inputs, opt.device)  # 正确传递所有参数
@@ -227,6 +227,17 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
             outputs, _ = model(**model_inputs)
         else:
             outputs = model(**model_inputs)
+
+        # 计算memory_loss
+        memory_loss = model.inter_memory.compute_diversity_loss_ortho()  # 确保返回的是 Tensor
+        losses = memory_loss * 0.001  # 确保是标量 Tensor
+        optimizer.zero_grad()
+        losses.backward()  # 正确，losses 是标量 Tensor
+        optimizer.step()   # 如果需要更新参数
+
+        with open("test_loss.log", 'a') as f:
+            f.write(f"{epoch_i}, batch: {batch_idx}, Memory diversity optimization: loss = {memory_loss.item():.6f}\n")
+            print(f"{epoch_i}, batch: {batch_idx}, Memory diversity optimization: loss = {memory_loss.item():.6f}")
 
         # saliency scores
         _saliency_scores = outputs["saliency_scores"].half()  # (bsz, short_memory_length)
@@ -283,16 +294,16 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, criterion=None):
     return mr_res, loss_meters
 
 
-def get_eval_res(epoch_i, model, eval_loader, opt, criterion):
+def get_eval_res(epoch_i, model, eval_loader, opt, optimizer, criterion):
     """compute and save query and video proposal embeddings"""
     # eval_res, eval_loss_meters = compute_mr_results(epoch_i, model, eval_loader, opt, criterion)
 
     #   criterion暂时还没修改，先不用
-    eval_res, eval_loss_meters = compute_mr_results(epoch_i, model, eval_loader, opt, criterion) 
+    eval_res, eval_loss_meters = compute_mr_results(epoch_i, model, eval_loader, opt, optimizer, criterion) 
     return eval_res, eval_loss_meters
 
 
-def eval_epoch(epoch_i, model, eval_dataset, opt, save_submission_filename, criterion=None):
+def eval_epoch(epoch_i, model, eval_dataset,optimizer, opt, save_submission_filename, criterion=None):
     logger.info("Generate submissions")
     model.eval()
 
@@ -323,7 +334,7 @@ def eval_epoch(epoch_i, model, eval_dataset, opt, save_submission_filename, crit
     #     return submission[0], eval_loss_meters, [save_metrics_path]
     # else:
 
-    submission, eval_loss_meters = get_eval_res(epoch_i, model, eval_loader, opt, criterion)  
+    submission, eval_loss_meters = get_eval_res(epoch_i, model, eval_loader, opt, optimizer, criterion)  
 
     metrics, latest_file_paths = eval_epoch_post_processing(
         submission, opt, eval_dataset.chunk_infos, eval_dataset.saliency_scores_list, save_submission_filename)
@@ -370,11 +381,11 @@ def setup_model(opt):
             checkpoint = torch.load(opt.model_path, map_location=opt.device)
             # 将权重加载到模型中
             model.load_state_dict(checkpoint['model'], strict=False)  # strict=False 允许部分加载
-            if model.use_inter_memory and model.future_memory_sample_len > 0:
-                # model.inter_memory.setInterMemory(memory=checkpoint['inter_memory'], future_embedding=checkpoint['future_embedding'], updateCnt=checkpoint['inter_memory_update_cnt'])
-                model.inter_memory.setInterMemory(updateCnt=checkpoint['inter_memory_update_cnt'])
-                model.inter_memory.memory_optimizer.load_state_dict(checkpoint['memory_optimizer'])
-                model.inter_memory.memory = model.inter_memory.memory.requires_grad_()
+            # if model.use_inter_memory and model.future_memory_sample_len > 0:
+            #     # model.inter_memory.setInterMemory(memory=checkpoint['inter_memory'], future_embedding=checkpoint['future_embedding'], updateCnt=checkpoint['inter_memory_update_cnt'])
+            #     model.inter_memory.setInterMemory(updateCnt=checkpoint['inter_memory_update_cnt'])
+            #     model.inter_memory.memory_optimizer.load_state_dict(checkpoint['memory_optimizer'])
+            #     model.inter_memory.memory = model.inter_memory.memory.requires_grad_()
 
             logger.info("Model weights loaded successfully (strict=False).")
         except Exception as e:
@@ -391,7 +402,8 @@ def setup_model(opt):
                 logger.info(f"Froze parameter: {name}")
     
     # 设置优化器和学习率调度器
-    param_dicts = [{"params": [p for n, p in model.named_parameters() if (p.requires_grad and n != "inter_memory")]}]
+    # param_dicts = [{"params": [p for n, p in model.named_parameters() if (p.requires_grad and n != "inter_memory.memory")]}]
+    param_dicts = [{"params": [p for n, p in model.named_parameters() if p.requires_grad]}]
     optimizer = torch.optim.AdamW(param_dicts, lr=opt.lr, weight_decay=opt.wd)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, opt.lr_drop)
 
@@ -438,7 +450,7 @@ def start_inference(opt, domain=None):
     
     # eval_dataset = CGDETR_StartEndDataset(**dataset_config) if opt.model_name == 'cg_detr' else StartEndDataset(**dataset_config)
     eval_dataset = StartEndDataset(**dataset_config)
-    model, criterion, _, _ = setup_model(opt)
+    model, criterion, optimizer, lr_scheduler = setup_model(opt)
     
     logger.info("Model checkpoint: {}".format(opt.model_path))
     if not load_labels:
@@ -449,7 +461,7 @@ def start_inference(opt, domain=None):
     logger.info("Starting inference...")
     with torch.no_grad():
         metrics, eval_loss_meters, latest_file_paths = \
-            eval_epoch(epoch_i, model, eval_dataset, opt, save_submission_filename)
+            eval_epoch(epoch_i, model, eval_dataset, optimizer, opt, save_submission_filename)
 
     # print("metrics is {}".format(metrics))
 

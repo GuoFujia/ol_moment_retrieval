@@ -64,8 +64,6 @@ class OLMomentDETR(nn.Module):
 
         self.use_txt_pos = use_txt_pos
         self.n_input_proj = n_input_proj
-        # self.foreground_thd = foreground_thd
-        # self.background_thd = background_thd
 
         self.use_vid_compression = use_vid_compression
         if self.use_vid_compression:
@@ -90,7 +88,7 @@ class OLMomentDETR(nn.Module):
             # 记忆槽长度64，输入原始历史帧特征序列
             # self.inter_memory = InterMemorySeq(d_model=hidden_dim, future_length=future_memory_sample_len, memory_slots=64, similarity_threshold=0.9, diversity_loss_weight=0.5, optimization_interval=10, optimizer_lr=1e-4)
             # 记忆槽长度为压缩后的帧特征长度，输入压缩后的历史帧特征序列
-            self.inter_memory = InterMemorySeq(d_model=hidden_dim, future_length=future_memory_sample_len, memory_slots=64, slot_len=self.compress_len, similarity_threshold=0.9, diversity_loss_weight=0.5, optimization_interval=10, optimizer_lr=1e-4)
+            self.inter_memory = InterMemorySeq(d_model=hidden_dim, future_length=future_memory_sample_len, memory_slots=64, slot_len=self.compress_len, similarity_threshold=0.9, diversity_loss_weight=0.5, optimization_interval=1, optimizer_lr=1e-4)
 
         self.query_embed = nn.Embedding(num_queries, hidden_dim)
         relu_args = [True] * 3
@@ -109,7 +107,7 @@ class OLMomentDETR(nn.Module):
         self.aux_loss = aux_loss
 
     def forward(self, src_txt, src_txt_mask, src_vid, memory_len, src_vid_mask, chunk_idx,qid_vid, short_memory_start, src_aud=None, src_aud_mask=None,
-                long_memory_weight=None):
+                long_memory_weight=None, gt_frames_in_long_memory=None):
         """
         在线模型forward需要的输入:
                 -src_txt: [batch_size, L_txt, D_txt]
@@ -273,8 +271,14 @@ class OLMomentDETR(nn.Module):
             if self.inter_memory.memory.device != src_vid.device:
                 self.inter_memory.memory.data = self.inter_memory.memory.data.to(src_vid.device)
                 self.inter_memory.future_embedding.data = self.inter_memory.future_embedding.data.to(src_vid.device)
-            # 调用forward，更新并预测
+            
             future_vid, future_mask = self.inter_memory.forward(history_features=compress_long_vid,mask=compress_long_mask,current_features=present_vid)
+            # if self.training:
+            #     # 训练阶段，调用forward，更新并预测
+            #     future_vid, future_mask = self.inter_memory.forward(history_features=compress_long_vid,mask=compress_long_mask,current_features=present_vid)
+            # else:
+            #     # 推理阶段，调用predict_future
+            #     future_vid, future_mask = self.inter_memory.predict_future(history_features=compress_long_vid,mask=compress_long_mask,current_features=present_vid)
 
             # 将未来部分拼接
             src_vid = torch.cat([src_vid, future_vid], dim=1)
