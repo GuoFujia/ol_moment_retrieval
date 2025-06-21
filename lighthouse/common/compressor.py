@@ -1738,7 +1738,7 @@ class CrossAttentionResidualCompressorWithQuery(TextGuidedCompressor):
         # Dropout
         self.cross_dropout = nn.Dropout(dropout)
         
-    def forward(self, Ft, text_mask, Fv, extern_weight=None, vid_mask=None):
+    def forward(self, Ft, text_mask, Fv, extern_weight=None, vid_mask=None, Fo_list=None):
         """
         前向传播
         
@@ -1748,6 +1748,7 @@ class CrossAttentionResidualCompressorWithQuery(TextGuidedCompressor):
             Fv: 长期视频记忆特征，形状为 (batch_size, vid_len, dimension)
             extern_weight: 外部提供的权重，形状为 (batch_size, vid_len)
             mask: 有效位置的掩码，形状为 (batch_size, vid_len)
+            Fo_list: 每个batch的最近compress_len个有效特征,一个长为bsz的列表
             
         返回:
             Fv_residual: 融合后的压缩视频特征，形状为 (batch_size, compress_len, dimension)
@@ -1758,15 +1759,20 @@ class CrossAttentionResidualCompressorWithQuery(TextGuidedCompressor):
         
         # 1. 首先获取压缩的视频特征 Fs (Fv_compress)
         Fs, compress_mask = super().forward(Ft, Fv, vid_mask = vid_mask, text_mask = text_mask, extern_weight = extern_weight)
-        
-        # 2. 提取每个batch的最近compress_len个有效特征作为Fo
         bool_mask = vid_mask.bool() if vid_mask is not None else torch.ones(batch_size, vid_len, dtype=torch.bool, device=device)
-        Fo_list = []
-        for batch in range(batch_size):
-            # 获取当前批次的有效特征
-            valid_features = Fv[batch][bool_mask[batch]]
-            # 取最后compress_len个
-            Fo_list.append(valid_features[-self.compress_len:])
+
+        # 2. 提取每个batch的最近compress_len个有效特征作为Fo
+        # Fo_list = []
+        # for batch in range(batch_size):
+        #     # 获取当前批次的有效特征
+        #     valid_features = Fv[batch][bool_mask[batch]]
+        #     # 取最后compress_len个
+        #     Fo_list.append(valid_features[-self.compress_len:])
+
+        # for i in range(len(Fo_list)):
+        #     print("shape of Fo_list[", i, "]", Fo_list[i].shape)
+            
+        # input("Press Enter to continue...")
         
         # 3. 创建Fo的填充张量和Fo的掩码
         padded_Fo = torch.zeros(batch_size, self.compress_len, dimension, device=device)

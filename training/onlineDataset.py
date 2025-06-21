@@ -103,7 +103,7 @@ class StartEndDataset(Dataset):
         
         # data
         self.data = self.load_data()
-        # sample_size = len(self.data) // 4
+        # sample_size = len(self.data) // 16
         # self.data = random.sample(self.data, sample_size)  # 随机抽取
         # self.data = self.data[:sample_size] # 只取前sample_size个
         self.load_saliency_scores() 

@@ -4,10 +4,10 @@ train_path: /home/gfj/lighthouse-main/data/qvhighlight/highlight_train_release.j
 eval_path: /home/gfj/lighthouse-main/data/qvhighlight/highlight_val_release.jsonl
 
 use_vid_compression: True
-use_inter_memory: True
+use_inter_memory: False
 
 weight_alpha: 0.7
-attn_weight: 0.1
+attn_weight: 0.01
 
 short_memory_len : 8
 long_memory_sample_len: 64

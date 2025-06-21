@@ -1084,6 +1084,7 @@ class InterMemorySeq(nn.Module):
                  diversity_loss_weight=0.5,  # 多样性损失权重
                  optimization_interval=10,   # 优化间隔（多少次forward后进行一次优化）
                  optimizer_lr=1e-4,         # 内部优化器学习率
+                 topk=4,                    
                  ):
         super(InterMemorySeq, self).__init__()
 
@@ -1096,6 +1097,7 @@ class InterMemorySeq(nn.Module):
         self.num_heads = num_heads
         self.pooling_type = pooling_type
         self.updateCnt = 0
+        self.topk = topk
 
         # 新增自动优化相关参数
         self.diversity_loss_weight = diversity_loss_weight
@@ -1150,12 +1152,16 @@ class InterMemorySeq(nn.Module):
         # 未来特征初始化嵌入
         self.future_embedding = nn.Parameter(torch.randn(future_length, d_model))
         
-        # 用于从记忆中读取信息的注意力机制
+        # read操作用到的注意力机制，在老版predict中用于和slots跨膜太交互，新版的只用和fused memory交互
         self.memory_read_attention = nn.MultiheadAttention(
             embed_dim=d_model,
             num_heads=num_heads,
             batch_first=True
         )
+
+        current_length = 8  # present的采样长度，这个参数只在这里用到了，先这样用着，另外历史帧长度用的slot_len，这点需要在InterMemory类定义的时候确保一致
+        # predict操作中，函数predict_future_direct_crossModal_andCompress中用到的压缩层
+        self.fc_compressor = nn.Linear(slot_len + current_length + future_length, future_length)
 
         # 用于对记忆读取结果进行自注意力处理的模块
         self.memory_self_attention = nn.MultiheadAttention(
@@ -1855,7 +1861,7 @@ class InterMemorySeq(nn.Module):
         if torch.isnan(self.memory).any():
             print("Warning: Memory contains NaN after update")
 
-    def update_memory_normal_topk(self, features, mask=None,topk=4, short_start=None, vid=None):
+    def update_memory_normal_topk(self, features, mask=None, short_start=None, vid=None):
         """
         基于输入特征序列更新记忆槽, 选择相似度最高的k个进行更新
         使用注意力机制融合信息到相似度高的记忆槽
@@ -1899,7 +1905,7 @@ class InterMemorySeq(nn.Module):
             # 找出相似度最高的k个记忆槽
             similarity = similarities[b]  # [memory_slots]
             # 找出相似度最高的k个记忆槽
-            topk_indices = torch.topk(similarity, k=topk, largest=True).indices
+            topk_indices = torch.topk(similarity, k=self.topk, largest=True).indices
             
             # 更新所选记忆槽
             for idx in topk_indices:
@@ -2056,7 +2062,7 @@ class InterMemorySeq(nn.Module):
         if torch.isnan(self.memory).any():
             print("Warning: Memory contains NaN after update")
 
-    def update_memory_normal_gtframes(self, features, gt_frames_in_long_memory, mask=None, short_start=None, vid=None):
+    def update_memory_normal_gtframes(self, features, mask=None, short_start=None, vid=None):
         """
         根据历史特征中和gt相交的帧数量/分类器输出决定是否更新
         更新的记忆槽仍基于相似度（topk）
@@ -2064,7 +2070,7 @@ class InterMemorySeq(nn.Module):
         
         Args:
             features: 输入特征，形状为 [batch_size, seq_length, d_model]
-            gt_frames_in_long_memory: 历史帧与GT窗口相交的帧数量，形状为[batch_size]
+            gt_frames_in_long_memory: 历史帧与GT窗口相交的帧数量，形状为[batch_size],如果不用分类器决定样本是否更更新则需要这个参数
             mask: 特征有效性掩码，形状为 [batch_size, seq_length]，1表示有效，0表示无效
                     如果为None，则视所有特征为有效
             short_start: 
@@ -2089,15 +2095,28 @@ class InterMemorySeq(nn.Module):
         # 统计每个样本输入，多少个记忆槽进行了更新
         update_per_sample = torch.zeros(batch_size, device=device, dtype=torch.int32)
 
+        # 用MLP分类器判断这批中每个样本是否要进行更新
+        # 平均池化: [batch_size, seq_length, d_model] -> [batch_size, d_model]
+        avg_pooled_features = torch.mean(features, dim=1)
+        # 分类: [batch_size, d_model] -> [batch_size]
+        classifier_logits = self.classifier(avg_pooled_features).squeeze(-1)
+        probs = torch.sigmoid(classifier_logits)
+        update_decision = (probs > 0.5).long()
+
         # 逐批次处理更新
         for b in range(batch_size):
             # 检查当前样本是否有有效特征
             if not mask[b].any():
                 continue
                 
-            # 判断当前样本是否需要更新,如果当前样本的相交帧数量小于7（中位数），则不更新
-            if gt_frames_in_long_memory[b] < 7:
+            # # 判断当前样本是否需要更新,如果当前样本的相交帧数量小于7（中位数），则不更新
+            # if gt_frames_in_long_memory[b] < 7:
+            #     continue
+
+            # 根据分类器的输出判断是否需要更新
+            if update_decision[b] == 0:
                 continue
+                
             
             # 获取当前样本的特征和掩码
             batch_features = features[b].unsqueeze(0)  # [1, seq_length, d_model]
@@ -2106,7 +2125,7 @@ class InterMemorySeq(nn.Module):
             # 找出相似度最高的k个记忆槽
             similarity = similarities[b]  # [memory_slots]
             # 找出相似度最高的k个记忆槽
-            topk_indices = torch.topk(similarity, k=topk, largest=True).indices
+            topk_indices = torch.topk(similarity, k=self.topk, largest=True).indices
             
             # 更新所选记忆槽
             for idx in topk_indices:
@@ -2152,6 +2171,7 @@ class InterMemorySeq(nn.Module):
         if torch.isnan(self.memory).any():
             print("Warning: Memory contains NaN after update")
 
+        return classifier_logits
 
     def read_memory(self, query_features, mask=None):
         """
@@ -2256,6 +2276,139 @@ class InterMemorySeq(nn.Module):
         
         return future_part, future_mask
 
+    def predict_future_direct_crossModal(self, history_features, current_features, RESIDUAL, mask=None):
+        """
+        基于历史特征、当前特征和记忆预测未来特征
+        注意，history——features要用压缩后的特征（确保无mask位）
+        基本步骤：
+        1. 首先将历史帧和当前帧拼接，然后计算每个slots的相似度
+        2. 然后根据相似度选择最相似的slots（topk等）进行fuse（融合）记为fused_memory
+        3. 拼接[history_features， current_features， self.future_embedding]（作为Q）与fused_memory（作为KV）做crossAttn得到full_features  
+        4. 根据RESIDUAL是否为True，选择是否将full_features与[history_features， current_features]做残差连接（连接的时候只连接历史帧和当前帧对应的部分）
+        5. 返回full_features和full_mask
+
+        
+        Args:
+            history_features: 历史特征，形状为 [batch_size, history_length, d_model]
+            current_features: 当前特征，形状为 [batch_size, current_length, d_model]
+            RESIDUAL: 是否使用残差连接
+            mask: 历史特征的有效性掩码，形状为 [batch_size, history_length]
+            
+        Returns:
+            full_features: 预测的未来特征，形状为 [batch_size, history_length+current_length+future_length, d_model]
+            full_mask: 未来特征的掩码，形状为 [batch_size, history_length+current_length+future_length]
+        """
+
+        # torch.autograd.set_detect_anomaly(True)
+        batch_size = history_features.shape[0]
+        device = history_features.device
+        
+        # 扩展未来嵌入以匹配批次大小
+        # future_embed: [batch_size, future_length, d_model]
+        future_embed = self.future_embedding.unsqueeze(0).expand(batch_size, -1, -1)
+        # future_embed = self.future_embedding.unsqueeze(0).repeat(batch_size, 1, 1)
+        
+        # 拼接历史特征、当前特征和未来嵌入
+        # concatenated_features: [batch_size, history_length+current_length+future_length, d_model]
+        concatenated_features = torch.cat([history_features, current_features, future_embed], dim=1)
+
+        # 拼接特征的mask
+        if mask is not None:
+            current_mask = torch.ones(batch_size, current_features.shape[1], 
+                                    device=device, dtype=mask.dtype)
+            future_mask = torch.ones(batch_size, future_embed.shape[1], 
+                                   device=device, dtype=mask.dtype)
+            concat_mask = torch.cat([mask, current_mask, future_mask], dim=1)
+        else:
+            concat_mask = None
+
+        # 1. 参考update方法中的做法，计算concatenated_features和slots的相似度
+        # similarities: [batch_size, memory_slots]
+        similarities = self.compute_sequence_similarity_frobenius(features=concatenated_features, mask=concat_mask)
+
+        # 2. 选择最相似的slots进行融合
+        # topk_similarities: [batch_size, topk], topk_indices: [batch_size, topk]
+        topk_similarities, topk_indices = torch.topk(similarities, k=self.topk, dim=1)
+        weights = torch.softmax(topk_similarities, dim=1)  # 归一化权重, [batch_size, topk]
+        
+        # #v1 修改这部分 - 正确处理batch维度的索引
+        # batch_size = topk_indices.shape[0]
+        # topk_slots = []
+        # for b in range(batch_size):
+        #     batch_slots = torch.stack([self.memory[idx] for idx in topk_indices[b]], dim=0)  # [topk, slot_len, d_model]
+        #     topk_slots.append(batch_slots)
+        # topk_slots = torch.stack(topk_slots, dim=0)  # [batch_size, topk, slot_len, d_model]
+
+        # # v2 使用更安全的索引方式
+        # memory_expanded = self.memory.unsqueeze(0).expand(batch_size, -1, -1, -1)  # [batch_size, memory_slots, slot_len, d_model]
+        # topk_indices_expanded = topk_indices.unsqueeze(-1).unsqueeze(-1).expand(-1, -1, self.memory.shape[1], self.memory.shape[2])  # [batch_size, topk, slot_len, d_model]
+        # topk_slots = torch.gather(memory_expanded, 1, topk_indices_expanded)  # [batch_size, topk, slot_len, d_model]
+
+        # v3 原来的
+        topk_slots = torch.stack([self.memory[i] for i in topk_indices], dim=0)  # [batch_size, topk, slot_len, d_model]
+
+        # # v4 不用topk函数，直接取固定的前4个记忆槽：结果还是不行，说明不是topk操作的问题
+        # 初始化topk_slots， 形状[batch_size, topk, slot_len, d_model]
+        # topk_slots = torch.zeros(batch_size, self.topk, self.memory.shape[1], self.memory.shape[2], device=device)
+        # #   取memory的前四个记忆槽
+        # topk_slots[:, :4] = self.memory[:4]
+        
+        
+        # 将weights扩展到 [batch_size, topk, 1, 1] 以便与 [batch_size, topk, slot_len, d_model] 相乘
+        # weights_expanded = weights.unsqueeze(-1).unsqueeze(-1)
+        # fused_memory = (weights_expanded * topk_slots).sum(dim=1)
+
+        # 创建weights的独立副本，断开梯度依赖
+        weights_detached = weights.detach().clone().requires_grad_(True)
+        weights_expanded = weights_detached.unsqueeze(-1).unsqueeze(-1)
+        fused_memory = (weights_expanded * topk_slots).sum(dim=1)
+        
+        # fused_memory = topk_slots.sum(dim=1)
+        # fused_memory = self.memory[0].unsqueeze(0).expand(batch_size, -1, -1)  # 只用第一个槽,这个可以了
+        # fused_memory = torch.einsum('bk,bksd->bsd', weights, topk_slots) # 这个不行
+
+        # 3. 使用cross attention生成完整特征
+        # concatenated_features作为Q，fused_memory作为K和V
+        # query: concatenated_features [batch_size, seq_len, d_model]
+        # key/value: fused_memory [batch_size, slot_len, d_model]
+        # 写这个的时候，基本就确定用压缩历史特征维护interMemory了，所有输入特征是无mask的，所以直接并行计算就行，不用像之前那样还要用循环
+        fused_memory_kv = fused_memory  # [batch_size, slot_len, d_model]
+        full_features, _ = self.memory_read_attention(
+            query=concatenated_features,
+            key=fused_memory_kv,
+            value=fused_memory_kv,
+            # key=concatenated_features,  # 直接用自己
+            # value=concatenated_features,  # 直接用自己
+        )
+        
+        # 4. 残差连接
+        if RESIDUAL:
+            # 只对历史和当前特征部分进行残差连接
+            history_current_length = history_features.shape[1] + current_features.shape[1]
+            # full_features[:, :history_current_length] += concatenated_features[:, :history_current_length]
+            full_features = full_features.clone()  # 显式复制
+            full_features[:, :history_current_length] += concatenated_features[:, :history_current_length]
+
+        # return concatenated_features, concat_mask
+        return full_features, concat_mask
+    
+    def predict_future_direct_crossModal_andCompress(self, history_features, current_features, mask=None):
+        # `H+P+Mf`跨模态交互后，经过压缩（先用Fc层试一下）得到（32*d）的特征作为预测结果
+        # [batch_size, history_length + current_length + future_length, d_model]
+        raw_res, raw_mask = self.predict_future_direct_crossModal(history_features=history_features, current_features=current_features, mask=mask, RESIDUAL=False)
+        # [batch_size, d_model, history_length + current_length + future_length]
+        transposed_res = raw_res.transpose(1, 2)
+        # [batch_size, d_model, future_length]
+        compressed_res = self.fc_compressor(transposed_res)
+        # [batch_size, future_length, d_model]
+        predicted_res = compressed_res.transpose(1, 2)
+
+        # raw_mask的后future_length取出来作为预测结果的mask
+        predicted_mask = raw_mask[:, -self.future_length:]
+
+        return predicted_res, predicted_mask
+
+
     def forward(self, history_features, current_features, mask=None, short_start=None, vid=None):
         """
         前向传播：更新记忆槽并预测未来特征
@@ -2275,21 +2428,22 @@ class InterMemorySeq(nn.Module):
         # 1. 更新记忆槽
         # self.update_memory_normal(features=history_features, mask=mask)
         # topk 更新
-        self.update_memory_normal_topk(features=history_features, mask=mask, topk=4)
+        self.update_memory_normal_topk(features=history_features, mask=mask)
         # 相似度归一化后根据阈值更新
         # self.update_memory_normal_guiyi(features=history_features, mask=mask)
         
         # 2. 预测未来特征
-        future_features, future_mask = self.predict_future(history_features, current_features, mask)
+        # future_features, future_mask = self.predict_future(history_features, current_features, mask)
+        future_features, future_mask = self.predict_future_direct_crossModal_andCompress(history_features=history_features,mask=mask,current_features=current_features)
         
-        # # 3. 增加forward计数器并检查是否需要执行多样性优化
-        # self.forward_counter += 1
-        # if (self.forward_counter % self.optimization_interval == 0):
-        #     with open("interMemory_Optimization.log", 'a') as f:
-        #         f.write(f"\n--- Performing memory diversity optimization (step {self.forward_counter}) ---\n")
-        #     print(f"\n--- Performing memory diversity optimization (step {self.forward_counter}) ---")
+        # 3. 增加forward计数器并检查是否需要执行多样性优化
+        self.forward_counter += 1
+        if (self.forward_counter % self.optimization_interval == 0):
+            with open("interMemory_Optimization.log", 'a') as f:
+                f.write(f"\n--- Performing memory diversity optimization (step {self.forward_counter}) ---\n")
+            print(f"\n--- Performing memory diversity optimization (step {self.forward_counter}) ---")
             
-        #     self.optimize_memory_diversity()
+            self.optimize_memory_diversity()
         
         return future_features, future_mask
 

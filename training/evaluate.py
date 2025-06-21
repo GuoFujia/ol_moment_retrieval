@@ -228,16 +228,16 @@ def compute_mr_results(epoch_i, model, eval_loader, opt, optimizer, criterion=No
         else:
             outputs = model(**model_inputs)
 
-        # 计算memory_loss
-        memory_loss = model.inter_memory.compute_diversity_loss_ortho()  # 确保返回的是 Tensor
-        losses = memory_loss * 0.001  # 确保是标量 Tensor
-        optimizer.zero_grad()
-        losses.backward()  # 正确，losses 是标量 Tensor
-        optimizer.step()   # 如果需要更新参数
+        # # 计算memory_loss
+        # memory_loss = model.inter_memory.compute_diversity_loss_ortho()  # 确保返回的是 Tensor
+        # losses = memory_loss * 0.001  # 确保是标量 Tensor
+        # optimizer.zero_grad()
+        # losses.backward()  # 正确，losses 是标量 Tensor
+        # optimizer.step()   # 如果需要更新参数
 
-        with open("test_loss.log", 'a') as f:
-            f.write(f"{epoch_i}, batch: {batch_idx}, Memory diversity optimization: loss = {memory_loss.item():.6f}\n")
-            print(f"{epoch_i}, batch: {batch_idx}, Memory diversity optimization: loss = {memory_loss.item():.6f}")
+        # with open("test_loss.log", 'a') as f:
+        #     f.write(f"{epoch_i}, batch: {batch_idx}, Memory diversity optimization: loss = {memory_loss.item():.6f}\n")
+        #     print(f"{epoch_i}, batch: {batch_idx}, Memory diversity optimization: loss = {memory_loss.item():.6f}")
 
         # saliency scores
         _saliency_scores = outputs["saliency_scores"].half()  # (bsz, short_memory_length)
@@ -381,11 +381,11 @@ def setup_model(opt):
             checkpoint = torch.load(opt.model_path, map_location=opt.device)
             # 将权重加载到模型中
             model.load_state_dict(checkpoint['model'], strict=False)  # strict=False 允许部分加载
-            # if model.use_inter_memory and model.future_memory_sample_len > 0:
+            if model.use_inter_memory and model.future_memory_sample_len > 0:
             #     # model.inter_memory.setInterMemory(memory=checkpoint['inter_memory'], future_embedding=checkpoint['future_embedding'], updateCnt=checkpoint['inter_memory_update_cnt'])
             #     model.inter_memory.setInterMemory(updateCnt=checkpoint['inter_memory_update_cnt'])
-            #     model.inter_memory.memory_optimizer.load_state_dict(checkpoint['memory_optimizer'])
-            #     model.inter_memory.memory = model.inter_memory.memory.requires_grad_()
+                model.inter_memory.memory_optimizer.load_state_dict(checkpoint['memory_optimizer'])
+                # model.inter_memory.memory = model.inter_memory.memory.requires_grad_()
 
             logger.info("Model weights loaded successfully (strict=False).")
         except Exception as e:

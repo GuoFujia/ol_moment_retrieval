@@ -104,6 +104,12 @@ class OLMomentDETR(nn.Module):
             LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
         ][:n_input_proj])
 
+        self.input_vid_proj1 = nn.Sequential(*[
+            LinearLayer(vid_dim + aud_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[0]),
+            LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[1]),
+            LinearLayer(hidden_dim, hidden_dim, layer_norm=True, dropout=input_dropout, relu=relu_args[2])
+        ][:n_input_proj])
+
         self.aux_loss = aux_loss
 
     def forward(self, src_txt, src_txt_mask, src_vid, memory_len, src_vid_mask, chunk_idx,qid_vid, short_memory_start, src_aud=None, src_aud_mask=None,
@@ -119,6 +125,7 @@ class OLMomentDETR(nn.Module):
                 -long_memory_weight: [batch_size, L_vid],在train的时候使用,用于提供extern_weight
                     -qid_vid: [batch_size,],在eval/train的时候都提供，用于将样本和saliency_score_dict中的标签匹配
                                 以及update_memory时提供
+                -gt_frames_in_long_memory: [batch_size],每个样本的历史帧与gt的相交帧数量
             返回值为包含以下内容的dict:
                 -"pred_spans": The normalized boxes coordinates for all queries, represented as
                                (center_x, width). These values are normalized in [0, 1],
@@ -151,6 +158,86 @@ class OLMomentDETR(nn.Module):
         #     input("捕获6083结束")
             
 
+        # # 为压缩过程准备只用最近帧投影得到的Fo_list
+        # batch_size = src_vid.shape[0]
+        # bool_mask = src_vid_mask[:, :memory_len[0]].bool() if src_vid_mask is not None else torch.ones(batch_size, memory_len[0], dtype=torch.bool, device=src_vid.device)
+        # Fo_list = []
+        # for batch in range(batch_size):
+        #     # 获取当前批次的有效特征
+        #     valid_features = src_vid[:, :memory_len[0]][batch][bool_mask[batch]]
+        #     # 取最后compress_len个
+        #     Fo_list.append(valid_features[-self.compress_len:])
+        # Fo_list = torch.stack(Fo_list, dim=0)
+        
+        # # 将Fo_list和src_vid的present即：src_vid[:,-memory_len[1]:,:]帧拼接并通过投影器
+        # projected_Fo_list = torch.cat([Fo_list, src_vid[:, -memory_len[1]:, :]], dim=1) 
+        # # 截取投影后的Fo_list的最近帧部分（就是撇掉present部分）
+        # Fo_list = projected_Fo_list[:, -self.compress_len:]
+
+        bsz = src_vid.shape[0]
+        history_len, present_len, future_len = memory_len
+        
+        # 分离三个部分
+        history_frames = src_vid[:, :history_len, :]  # [bsz, long_memory_sample_length, d_model]
+        present_frames = src_vid[:, history_len:history_len+present_len, :]  # [bsz, present_len, d_model]
+        
+        history_mask = src_vid_mask[:, :history_len]  # [bsz, long_memory_sample_length]
+        present_mask = src_vid_mask[:, history_len:history_len+present_len]  # [bsz, present_len]
+
+        batch_results = []
+        batch_masks = []
+        for b in range(bsz):
+            # 找到当前batch中历史帧的有效位置
+            valid_indices = torch.where(history_mask[b])[0]  # 有效位的索引
+            if len(valid_indices) >= self.compress_len:
+                # 如果有效帧数量 >= compress_len，取最近的compress_len个有效帧
+                recent_valid_indices = valid_indices[-self.compress_len:]
+                recent_history = history_frames[b, recent_valid_indices, :]  # [compress_len, d_model]
+                recent_mask = torch.ones(self.compress_len, dtype=torch.bool, device=history_mask.device)
+            else:
+                # 如果有效帧数量 < compress_len，取所有有效帧并padding
+                recent_history_valid = history_frames[b, valid_indices, :]  # [valid_num, d_model]
+                padding_len = self.compress_len - len(valid_indices)
+                
+                # 用零padding
+                if len(valid_indices) > 0:
+                    # 用零填充不足的部分
+                    zero_padding = torch.zeros(padding_len, history_frames.shape[-1], device=history_frames.device)
+                    recent_history = torch.cat([recent_history_valid, zero_padding], dim=0)
+                else:
+                    # 如果没有有效帧，用零填充
+                    recent_history = torch.zeros(self.compress_len, history_frames.shape[-1], device=history_frames.device)
+                
+                # 创建对应的mask
+                recent_mask = torch.cat([
+                    torch.ones(len(valid_indices), dtype=torch.bool, device=history_mask.device),
+                    torch.zeros(padding_len, dtype=torch.bool, device=history_mask.device)
+                ])
+            # 拼接present帧
+            recent_present_frame = torch.cat([recent_history, present_frames[b]], dim=0)  # [compress_len+present_len, d_model]
+            recent_present_mask = torch.cat([recent_mask, present_mask[b]], dim=0)  # [compress_len+present_len]
+            
+            batch_results.append(recent_present_frame)
+            batch_masks.append(recent_present_mask)
+        
+        # 堆叠成batch
+        batched_recent_present_frames = torch.stack(batch_results, dim=0)  # [bsz, compress_len+present_len, d_model]
+        batched_recent_present_masks = torch.stack(batch_masks, dim=0)  # [bsz, compress_len+present_len]
+        
+        # 投影
+        # projected_recent_present_frame = self.input_vid_proj(batched_recent_present_frames)  # [bsz, compress_len+present_len, proj_dim]
+        projected_recent_present_frame = self.input_vid_proj1(batched_recent_present_frames)  # [bsz, compress_len+present_len, proj_dim]
+        
+        # 取前compress_len部分
+        projected_recent_frame = projected_recent_present_frame[:, :self.compress_len] # [bsz, compress_len, proj_dim]
+        projected_recent_mask = batched_recent_present_masks[:, :self.compress_len].bool() # [bsz, compress_len]
+
+        # 取每个projected_recent_frame的有效位,把每个批次的结果依次放进一个列表中
+        Fo_list = []
+        for b in range(bsz):
+            Fo_list.append(projected_recent_frame[b][projected_recent_mask[b]])
+
+    
 
         #   拼接音频特征
         if src_aud is not None:
@@ -227,7 +314,7 @@ class OLMomentDETR(nn.Module):
             # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, mask=long_vid_mask)
             # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, mask=long_vid_mask, query=src_txt, query_mask=src_txt_mask)
             # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, vid_mask=long_vid_mask, Ft=src_txt, text_mask=src_txt_mask)
-            compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, vid_mask=long_vid_mask, Ft=src_txt, text_mask=src_txt_mask,extern_weight=extern_weight)
+            compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, vid_mask=long_vid_mask, Ft=src_txt, text_mask=src_txt_mask,extern_weight=extern_weight,Fo_list=Fo_list)
             # compress_long_vid, compress_long_mask = self.memory_compressor(Fv = long_vid, vid_mask=long_vid_mask, Ft=src_txt, text_mask=src_txt_mask, Fg=present_vid)
 
             # print("chunk_idx\n", chunk_idx)
@@ -280,10 +367,25 @@ class OLMomentDETR(nn.Module):
             #     # 推理阶段，调用predict_future
             #     future_vid, future_mask = self.inter_memory.predict_future(history_features=compress_long_vid,mask=compress_long_mask,current_features=present_vid)
 
-            # 将未来部分拼接
+            # 下面这个操作是用的优化后的predict：直接输出处理好的历史帧+现在帧+预测帧，这个结果直接用来做跨膜太交互
+            # 先更新
+            # self.inter_memory.update_memory_normal_topk(features=compress_long_vid, mask=compress_long_mask)
+            # 更新记忆-同时接收分类器logits结果
+            # classifier_logits = self.inter_memory.update_memory_normal_gtframes(features=compress_long_vid, mask=compress_long_mask)
+
+            # 再输出预测结果
+            # src_vid, src_vid_mask = self.inter_memory.predict_future_direct_crossModal(history_features=compress_long_vid,mask=compress_long_mask,current_features=present_vid, RESIDUAL=False)
+            # future_vid, future_mask = self.inter_memory.predict_future_direct_crossModal(history_features=compress_long_vid,mask=compress_long_mask,current_features=present_vid, RESIDUAL=True)
+            # future_vid, future_mask = self.inter_memory.predict_future_direct_crossModal_andCompress(history_features=compress_long_vid,mask=compress_long_mask,current_features=present_vid)
+
+
+            # predict_future_direct_crossModal这个函数输出的是整个拼接特征和记忆槽交互的结果，所以predict结果应该取后future_memory_sample_len位
+            # future_vid, future_mask = future_vid[:, -self.future_memory_sample_len:], future_mask[:, -self.future_memory_sample_len:]
+
+            # 将未来部分拼接（根据预测的操作不同，这一步可能不需要）
             src_vid = torch.cat([src_vid, future_vid], dim=1)
             src_vid_mask = torch.cat([src_vid_mask, future_mask], dim=1)
-
+        
         #   拼接视频和文本的特征，掩码
         src = torch.cat([src_vid, src_txt], dim=1)  # (bsz, L_vid+L_txt, d)
         mask = torch.cat([src_vid_mask, src_txt_mask], dim=1).bool()  # (bsz, L_vid+L_txt)
@@ -330,6 +432,9 @@ class OLMomentDETR(nn.Module):
 
         # 添加 chunk_idx 到输出
         out["chunk_idx"] = chunk_idx  # [batch_size]
+
+        # 添加 classifier_logits 到输出,用于优化分类器
+        # out["classifier_logits"] = classifier_logits
 
         # 维护和更新saliency_score_dict的逻辑
         if self.use_vid_compression and not self.training and qid_vid is not None and short_memory_start is not None:
@@ -823,11 +928,21 @@ class SetCriterionOl(nn.Module):
         final_loss = loss_contrastive + loss_ce + loss_smooth_l1
         return {"loss_saliency": final_loss}
 
+    def loss_classifier(self, outputs, targets, **kwargs):
+        classifier_logits = outputs['classifier_logits']
+        # 计算优化classifier的标签
+        classifier_labels = (targets['gt_frames_in_long_memory'] > 16).float()
+        # 计算loss
+        loss = F.binary_cross_entropy_with_logits(classifier_logits, classifier_labels)
+
+        return {"loss_classifier": loss}
+
     def get_loss(self, loss, outputs, targets, indices, **kwargs):
         loss_map = {
             "labels": self.loss_labels,
             "saliency": self.loss_saliency,
             "span": self.new_loss_spans,
+            "classifier": self.loss_classifier,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, **kwargs)
@@ -928,8 +1043,9 @@ def build_model(args):
     }
     
     # 条件性添加损失项
+    # losses = ['labels', 'saliency', 'span', 'classifier']
     losses = ['labels', 'saliency', 'span']
-    # losses = ['labels', 'span']
+
     
     # loss_label消融实验
     # losses = ['labels', 'saliency']

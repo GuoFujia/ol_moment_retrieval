@@ -72,7 +72,7 @@ def save_checkpoint(model, optimizer, lr_scheduler, epoch_i, opt, inter_memory_u
         "epoch": epoch_i,
         "opt": opt,
         # "inter_memory_update_cnt": inter_memory_update_cnt,
-        # "memory_optimizer": memory_optimizer
+        "memory_optimizer": memory_optimizer.state_dict() if memory_optimizer is not None else None
     }
     torch.save(checkpoint, opt.ckpt_filepath)
 

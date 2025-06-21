@@ -141,16 +141,15 @@ def train_epoch(model, criterion, train_loader, optimizer, opt, epoch_i):
         outputs = model(**model_inputs)  
         total_loss, loss_dict = criterion(outputs, targets)
 
-        # 把interMemory的loss放在这里一起优化
-        memory_loss = model.inter_memory.compute_diversity_loss_ortho()
-        total_loss += memory_loss*0.001
-        loss_dict["loss_memory"] = memory_loss.item()
+        # # 把interMemory的loss放在这里一起优化
+        # memory_loss = model.inter_memory.compute_diversity_loss_ortho()
+        # total_loss += memory_loss*0.001
+        # loss_dict["loss_memory"] = memory_loss.item()
 
-        # losses = sum(loss_dict[k] * criterion.weight_dict[k] for k in loss_dict.keys() if k in criterion.weight_dict)
 
         # 不用weight_dict，将loss简单相加
         losses = total_loss
-        
+        # torch.autograd.set_detect_anomaly(True)
         optimizer.zero_grad()
         losses.backward()
             
@@ -205,8 +204,9 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
 
         if opt.model_ema:
             model_ema.update(model)
-
-        if (epoch_i + 1) % opt.eval_epoch_interval == 0:
+        
+        if (epoch_i + 1) % (opt.eval_epoch_interval * 2) == 0 and (epoch_i + 1) <= 20 or \
+           (epoch_i + 1) % opt.eval_epoch_interval == 0 and (epoch_i + 1) > 20:
             # with torch.no_grad():
             if opt.model_ema:
                 metrics, eval_loss_meters, latest_file_paths = \
@@ -226,14 +226,14 @@ def train(model, criterion, optimizer, lr_scheduler, train_dataset, val_dataset,
             if stop_score > prev_best_score:
                 prev_best_score = stop_score
                 # test时不优化interMemory，所以只用保存那些个parameter即可
-                save_checkpoint(model, optimizer, lr_scheduler, epoch_i, opt)
+                # save_checkpoint(model, optimizer, lr_scheduler, epoch_i, opt)
                 # test时也优化interMemory
-                # if model.use_inter_memory and model.future_memory_sample_len > 0:
-                #     save_checkpoint(model, optimizer, lr_scheduler, epoch_i, opt, 
-                #         inter_memory_update_cnt=model.inter_memory.getUpdateCnt(), 
-                #         memory_optimizer=model.inter_memory.memory_optimizer)
-                # else:
-                #     save_checkpoint(model, optimizer, lr_scheduler, epoch_i, opt)
+                if model.use_inter_memory and model.future_memory_sample_len > 0:
+                    save_checkpoint(model, optimizer, lr_scheduler, epoch_i, opt, 
+                        inter_memory_update_cnt=model.inter_memory.getUpdateCnt(), 
+                        memory_optimizer=model.inter_memory.memory_optimizer)
+                else:
+                    save_checkpoint(model, optimizer, lr_scheduler, epoch_i, opt)
                 logger.info("The checkpoint file has been updated.")
                 rename_latest_to_best(latest_file_paths)
 
